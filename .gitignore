@@ -1,1 +1,13 @@
+# PlatformIO
 .pio
+.cache/
+
+# macOS
+.DS_Store
+
+# KiCad
+*.lck
+fp-info-cache
+#auto_saved_files#
+_autosave-*
+*-backups/
