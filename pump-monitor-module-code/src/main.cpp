@@ -1,9 +1,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-
 
 // Pin configuration
 #define CT_ADC_PIN 2
@@ -14,15 +14,50 @@
 #define SDA_PIN 6
 #define SCL_PIN 7
 
+// WiFi and Collector Configuration
+// WiFi credentials are set via build flags in platformio.ini
+#define WIFI_SSID "SMARTLAB_2.4G"
+#define WIFI_PASSWORD "74Lynx#155BLUE=92+top"
+
+// Collector endpoint - CHANGE THIS TO YOUR COLLECTOR'S IP ADDRESS
+#define COLLECTOR_HOST "192.168.140.5"  // Update with your collector's IP
+#define COLLECTOR_PORT 8000
+#define COLLECTOR_PATH "/esp/receive_send"
+
+// Sensor IDs (used to identify each sensor in the NEMO database)
+#define SENSOR_ID_CURRENT 29      // Current Transformer
+#define SENSOR_ID_TEMP_1 30        // Temperature Sensor 1
+#define SENSOR_ID_TEMP_2 31        // Temperature Sensor 2
+#define SENSOR_ID_ACCELEROMETER 32 // MPU6050 Accelerometer
+
+// Operating mode configuration
+#ifdef TEST_MODE
+  const unsigned long READING_INTERVAL_MS = 30000;  // 30 seconds for test mode
+  const bool ENABLE_WIFI = false;                   // No WiFi in test mode
+  const bool ENABLE_UPLOAD = false;                 // No uploads in test mode
+#else
+  const unsigned long READING_INTERVAL_MS = 900000; // 15 minutes for production
+  const bool ENABLE_WIFI = true;                    // Enable WiFi in production
+  const bool ENABLE_UPLOAD = true;                  // Enable uploads in production
+#endif
+
 // MPU-6050 IMU object
 Adafruit_MPU6050 mpu;
 bool mpu6050_initialized = false;
+bool wifi_connected = false;
+
+// WiFi reconnection timing
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 300000; // 5 minutes in milliseconds
+unsigned long last_wifi_reconnect_attempt = 0;
 
 // Function prototypes
 float readThermistor(int pin, float& millivolts, float& resistance);
 float readCurrentTransformer(int pin, float& rms_millivolts);
 float takeAccelerometerMeasurement();
 void scanI2C();
+bool connectWiFi();
+bool sendSensorData(float value, int sensor_id);
+void checkAndReconnectWiFi();
 
 void setup() {
   // Start Serial immediately
@@ -111,6 +146,29 @@ void setup() {
     Serial.println("MPU6050 initialized successfully!");
   }
   Serial.flush();
+  
+  // Connect to WiFi (only in production mode)
+  #ifndef TEST_MODE
+  Serial.println("\n=== Connecting to WiFi ===");
+  wifi_connected = connectWiFi();
+  
+  if (wifi_connected) {
+    Serial.println("✅ WiFi connected successfully!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("❌ WiFi connection failed!");
+    Serial.println("Continuing without WiFi - sensor data will not be sent");
+    Serial.println("Will retry WiFi connection every 5 minutes");
+  }
+  
+  // Initialize reconnection timer
+  last_wifi_reconnect_attempt = millis();
+  #else
+  Serial.println("\n=== TEST MODE ===");
+  Serial.println("WiFi disabled - data will only be printed to Serial");
+  Serial.println("Reading sensors every 30 seconds");
+  #endif
   
   Serial.println("=== Setup Complete ===\n");
 }
@@ -219,9 +277,12 @@ float readCurrentTransformer(int pin, float &rms_millivolts)
     rms_millivolts = rms_mv;
 
     // You MUST calibrate this number:
-    const float MILLIVOLTS_PER_AMP = 2.8; // placeholder — adjust after calibration
+    const float MILLIVOLTS_PER_AMP = 3.6; // placeholder — adjust after calibration
 
     float amps = rms_mv / MILLIVOLTS_PER_AMP;
+  #ifndef TEST_MODE
+  Serial.println("rms_mv: " + String(rms_mv));
+  #endif
     return amps;
 }
 
@@ -254,7 +315,7 @@ float takeAccelerometerMeasurement() {
         }
 
         float z_minus_g = accel.acceleration.z - 9.81;
-        
+
         // Calculate magnitude of acceleration vector: sqrt(x^2 + y^2 + z^2)
         float magnitude = sqrt(accel.acceleration.x * accel.acceleration.x + 
                                accel.acceleration.y * accel.acceleration.y + 
@@ -278,25 +339,108 @@ float takeAccelerometerMeasurement() {
     return rms_acceleration;  // Returns RMS acceleration in m/s^2
 }
 
-void loop() {
-  Serial.println("LOOP RUNNING");  // Simple test output
-  delay(100);
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
-  // Read thermistors (10kOhm)
-  // float temp1_mv, temp1_resistance;
-  // float temp1 = readThermistor(TEMP_1_ADC_PIN, temp1_mv, temp1_resistance);
-  // Serial.println("Temperature 1: " + String(temp1));
-  // Serial.println("Millivolts: " + String(temp1_mv));
-  // Serial.println("Resistance: " + String(temp1_resistance) + " Ω");
-  // Serial.println("--------------------------------");
-  // // float temp2_mv, temp2_resistance;
-  // float temp2 = readThermistor(TEMP_2_ADC_PIN, temp2_mv, temp2_resistance);
-  // Serial.println("Temperature 2: " + String(temp2));
-  // Serial.println("Millivolts: " + String(temp2_mv));
-  // Serial.println("Resistance: " + String(temp2_resistance) + " Ω");
-  // Serial.println("--------------------------------");
-  // Read current transformer (centered at 1.65V)
-  // Collect and smooth 5 seconds worth of data
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 20;  // 20 seconds timeout
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < MAX_ATTEMPTS) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  } else {
+    Serial.println("WiFi connection timeout");
+    return false;
+  }
+}
+
+void checkAndReconnectWiFi() {
+  unsigned long current_time = millis();
+  
+  // Check if WiFi is disconnected and enough time has passed since last attempt
+  if (WiFi.status() != WL_CONNECTED) {
+    // Check if it's time to retry (handles millis() overflow)
+    if (current_time - last_wifi_reconnect_attempt >= WIFI_RECONNECT_INTERVAL_MS || 
+        current_time < last_wifi_reconnect_attempt) {  // Handle millis() overflow
+      
+      Serial.println("\n=== WiFi Disconnected - Attempting Reconnection ===");
+      wifi_connected = connectWiFi();
+      last_wifi_reconnect_attempt = current_time;
+      
+      if (wifi_connected) {
+        Serial.println("✅ WiFi reconnected successfully!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("❌ WiFi reconnection failed - will retry in 5 minutes");
+      }
+    }
+  } else {
+    // WiFi is connected, update the flag
+    if (!wifi_connected) {
+      wifi_connected = true;
+      Serial.println("✅ WiFi connection restored!");
+    }
+  }
+}
+
+bool sendSensorData(float value, int sensor_id) {
+  if (!wifi_connected || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  
+  HTTPClient http;
+  String url = "http://" + String(COLLECTOR_HOST) + ":" + String(COLLECTOR_PORT) + COLLECTOR_PATH;
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Create JSON payload matching collector.py expected format
+  // Format: {"value": 22.5, "sensor": 27}
+  String jsonPayload = "{\"value\":" + String(value, 4) + ",\"sensor\":" + String(sensor_id) + "}";
+  
+  int httpResponseCode = http.POST(jsonPayload);
+  
+  bool success = (httpResponseCode == 200);
+  
+  if (success) {
+    Serial.print("✅ Sent sensor ");
+    Serial.print(sensor_id);
+    Serial.print(": ");
+    Serial.print(value, 4);
+    Serial.print(" (HTTP ");
+    Serial.print(httpResponseCode);
+    Serial.println(")");
+  } else {
+    Serial.print("❌ Failed to send sensor ");
+    Serial.print(sensor_id);
+    Serial.print(" (HTTP ");
+    Serial.print(httpResponseCode);
+    Serial.println(")");
+  }
+  
+  http.end();
+  return success;
+}
+
+void loop() {
+  // Check WiFi connection and reconnect if necessary (only in production mode)
+  #ifndef TEST_MODE
+  checkAndReconnectWiFi();
+  #endif
+  
+  Serial.println("\n=== Reading Sensors ===");
+  
+  // 1. Read Current Transformer (sensor ID 1)
+  Serial.println("Reading Current Transformer...");
   const unsigned long SMOOTHING_DURATION_MS = 5000; // 5 seconds
   unsigned long start_time = millis();
   float sum_current = 0.0;
@@ -309,32 +453,62 @@ void loop() {
     sum_current += current;
     sum_rms_mv += current_rms_mv;
     reading_count++;
-    delay(100); // Small delay between readings
+    delay(100);
   }
   
-  // Calculate smoothed averages
   float smoothed_current = sum_current / reading_count;
-  float smoothed_rms_mv = sum_rms_mv / reading_count;
+  Serial.println("Current (5s avg): " + String(smoothed_current) + " A");
+  #ifndef TEST_MODE
+  if (ENABLE_UPLOAD) {
+    sendSensorData(smoothed_current, SENSOR_ID_CURRENT);
+  }
+  #endif
   
-  // Print smoothed results
-  Serial.println("Current (5s avg): " + String(smoothed_current));
-  Serial.println("RMS Millivolts (5s avg): " + String(smoothed_rms_mv));
-  Serial.println("Readings: " + String(reading_count));
-  Serial.println("--------------------------------");
-  // // Read accelerometer
-  // float acceleration = takeAccelerometerMeasurement();
-  // if (acceleration < 0) {
-  //   if (acceleration == -1.0) {
-  //     Serial.println("Acceleration: MPU6050 not initialized");
-  //   } else if (acceleration == -2.0) {
-  //     Serial.println("Acceleration: I2C communication error");
-  //   } else {
-  //     Serial.println("Acceleration: MPU6050 not available");
-  //   }
-  // } else {
-  //   Serial.println("Acceleration: " + String(acceleration));
-  // }
-  // Serial.println("--------------------------------");
-  delay(1000); // TODO: Adjust sampling rate
+  // 2. Read Temperature Sensor 1 (sensor ID 2)
+  Serial.println("Reading Temperature Sensor 1...");
+  float temp1_mv, temp1_resistance;
+  float temp1 = readThermistor(TEMP_1_ADC_PIN, temp1_mv, temp1_resistance);
+  Serial.println("Temperature 1: " + String(temp1) + " °C");
+  #ifndef TEST_MODE
+  if (ENABLE_UPLOAD) {
+    sendSensorData(temp1, SENSOR_ID_TEMP_1);
+  }
+  #endif
+  
+  // 3. Read Temperature Sensor 2 (sensor ID 3)
+  Serial.println("Reading Temperature Sensor 2...");
+  float temp2_mv, temp2_resistance;
+  float temp2 = readThermistor(TEMP_2_ADC_PIN, temp2_mv, temp2_resistance);
+  Serial.println("Temperature 2: " + String(temp2) + " °C");
+  #ifndef TEST_MODE
+  if (ENABLE_UPLOAD) {
+    sendSensorData(temp2, SENSOR_ID_TEMP_2);
+  }
+  #endif
+  
+  // 4. Read Accelerometer (sensor ID 4)
+  Serial.println("Reading Accelerometer...");
+  float acceleration = takeAccelerometerMeasurement();
+  if (acceleration < 0) {
+    if (acceleration == -1.0) {
+      Serial.println("Acceleration: MPU6050 not initialized - skipping");
+    } else if (acceleration == -2.0) {
+      Serial.println("Acceleration: I2C communication error - skipping");
+    } else {
+      Serial.println("Acceleration: MPU6050 not available - skipping");
+    }
+  } else {
+    Serial.println("Acceleration: " + String(acceleration) + " m/s²");
+    #ifndef TEST_MODE
+    if (ENABLE_UPLOAD) {
+      sendSensorData(acceleration, SENSOR_ID_ACCELEROMETER);
+    }
+    #endif
+  }
+  
+  Serial.println("=== Sensor Reading Cycle Complete ===\n");
+  
+  // Wait before next reading cycle
+  delay(READING_INTERVAL_MS);
 }
 

@@ -1,0 +1,12 @@
+{
+  // Disable Microsoft C++ extension IntelliSense to avoid conflicts with clangd
+  "C_Cpp.intelliSenseEngine": "disabled",
+  
+  // Ensure clangd is enabled
+  "clangd.enable": true,
+  
+  // Optional: Use compile_commands.json (you already have this file)
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}"
+  ]
+}
