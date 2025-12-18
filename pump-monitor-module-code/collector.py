@@ -60,12 +60,15 @@ def receive_send():
     # Generate timestamp when collector receives the data
     created_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
+    # Round value to one decimal place before sending to Nemo
+    rounded_value = round(float(sensor_value), 1)
+    
     print(f"📦 Received packet → Timestamp: {created_date}, Value: {sensor_value}, Sensor ID: {sensor_id}")
 
     # Construct payload for NEMO (with timestamp added by collector)
     nemo_payload = {
         "created_date": created_date,
-        "value": sensor_value,
+        "value": rounded_value,
         "sensor": sensor_id
     }
 

@@ -405,7 +405,7 @@ bool sendSensorData(float value, int sensor_id) {
   
   // Create JSON payload matching collector.py expected format
   // Format: {"value": 22.5, "sensor": 27}
-  String jsonPayload = "{\"value\":" + String(value, 4) + ",\"sensor\":" + String(sensor_id) + "}";
+  String jsonPayload = "{\"value\":" + String(value, 1) + ",\"sensor\":" + String(sensor_id) + "}";
   
   int httpResponseCode = http.POST(jsonPayload);
   
@@ -415,7 +415,7 @@ bool sendSensorData(float value, int sensor_id) {
     Serial.print("✅ Sent sensor ");
     Serial.print(sensor_id);
     Serial.print(": ");
-    Serial.print(value, 4);
+    Serial.print(value, 1);
     Serial.print(" (HTTP ");
     Serial.print(httpResponseCode);
     Serial.println(")");
