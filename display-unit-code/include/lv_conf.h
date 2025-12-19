@@ -16,7 +16,7 @@
 #define LV_COLOR_DEPTH 16
 
 /*Swap the 2 bytes of RGB565 color. Useful if the display has an 8-bit interface (e.g. SPI)*/
-#define LV_COLOR_16_SWAP 0
+#define LV_COLOR_16_SWAP 1  // Enabled because colors are rotated (RGB→BRG)
 
 /*Enable more complex drawing routines to manage screens transparency.
  *Can be used if the UI is above another layer, e.g. an OSD menu or video player.*/
@@ -25,7 +25,7 @@
 /* Adjust color mix functions rounding. GPUs might calculate color mix (blending) differently.
  * 0: round down, 64: round up, 128: round nearest, 192: round up from 128
  */
-#define LV_COLOR_MIX_ROUND_OFS 0
+#define LV_COLOR_MIX_ROUND_OFS 128
 
 /*====================
    MEMORY SETTINGS
@@ -115,11 +115,6 @@
 /*Number of stops allowed per gradient. Increase this to allow more stops.
  *This adds (sizeof(lv_color_t) + 1) bytes per additional stop*/
 #define LV_GRADIENT_MAX_STOPS 2
-
-/* Adjust color mix functions rounding. GPUs might calculate color mix (blending) differently.
- * 0: round down, 64: round up, 128: round nearest, 192: round up from 128
- */
-#define LV_COLOR_MIX_ROUND_OFS 0
 
 /*-------------
  * GPU
@@ -227,6 +222,36 @@
 /*Default Dot Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  *(Not so important, you can adjust it to modify default sizes and spaces)*/
 #define LV_DPI_DEF 130     /*[px/inch]*/
+
+/*====================
+ *  FONTS
+ *====================*/
+
+/*Montserrat fonts with various sizes. Set to 1 to enable, 0 to disable.*/
+#define LV_FONT_MONTSERRAT_8  0
+#define LV_FONT_MONTSERRAT_10 0
+#define LV_FONT_MONTSERRAT_12 0
+#define LV_FONT_MONTSERRAT_14 1  /*Default font*/
+#define LV_FONT_MONTSERRAT_16 0  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_18 0  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_20 0  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_22 0  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_24 1  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_26 0
+#define LV_FONT_MONTSERRAT_28 0  /*Enable for larger text*/
+#define LV_FONT_MONTSERRAT_30 0
+#define LV_FONT_MONTSERRAT_32 0
+#define LV_FONT_MONTSERRAT_34 0
+#define LV_FONT_MONTSERRAT_36 0  /*Enable for very large text*/
+#define LV_FONT_MONTSERRAT_38 0
+#define LV_FONT_MONTSERRAT_40 0
+#define LV_FONT_MONTSERRAT_42 0
+#define LV_FONT_MONTSERRAT_44 0
+#define LV_FONT_MONTSERRAT_46 0
+#define LV_FONT_MONTSERRAT_48 0  /*Enable for very large text*/
+
+/*Default font*/
+#define LV_FONT_DEFAULT &lv_font_montserrat_14
 
 /*====================
  *  WIDGETS
