@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define I2C_BAUD 11
-#define Vref 3.3f
+#define VREF 3.3f
 #define ADC_MAX 1023.0f
 #define R_FIXED 10000.0f // CHANGE WITH ACTUAL RESISTOR VALUE
 
@@ -14,6 +14,8 @@ static void adc_init(void);
 static void spi_init(void);
 static void i2c_init(void);
 static uint16_t adc_read(uint8_t channel);
+static float ntc_resistance(float adc);
+static float adc_to_voltage(uint16_t adc);
 
 static void system_init(void){
     clock_init();
@@ -97,17 +99,18 @@ static uint16_t adc_read(uint8_t channel){
 }
 
 void sample_all_adc(void){
+    uint16_t adc_raw[3];
     adc_raw[0] = adc_read(ADC_MUXPOS_AIN0_gc);
     adc_raw[1] = adc_read(ADC_MUXPOS_AIN1_gc);
     adc_raw[2] = adc_read(ADC_MUXPOS_AIN2_gc);
 }
 
-float ntc_resistance(uint16_t adc){
+float ntc_resistance(float adc){
     return (R_FIXED * VREF/ adc_to_voltage(adc) - 1.0f);
 }
 
 float adc_to_voltage(uint16_t adc){
-    return (adc*Vref)/ ADC_MAX;
+    return (adc*VREF)/ ADC_MAX;
 }
 
 int main(void){
