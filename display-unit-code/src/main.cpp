@@ -28,7 +28,7 @@
 
 // HSPI pin definitions (HSPI bus pins on ESP32)
 #define HSPI_MOSI 13        // GPIO13 - HSPI MOSI
-#define HSPI_MISO 12        // GPIO12 - HSPI MISO
+#define HSPI_MISO 25        // GPIO25 - HSPI MISO (changed from GPIO12 to avoid boot strap issues)
 #define HSPI_SCK 14         // GPIO14 - HSPI Clock
 
 // SPI Command codes
@@ -209,22 +209,62 @@ void create_monitoring_screen() {
 
 // Request sensor data from SPI slave (using HSPI bus)
 bool requestSensorData(SensorData* data) {
-    // Select slave
+    // Initialize buffer to zeros for safety
+    uint8_t buffer[16] = {0};
+    
+    // Select slave - pull CS LOW to activate slave
     digitalWrite(SPI_CS_PIN, LOW);
     delayMicroseconds(10);  // Small delay for slave to be ready
     
     // Send command to request data using HSPI
     hspi.beginTransaction(SPISettings(SPI_FREQ, MSBFIRST, SPI_MODE0));
-    hspi.transfer(CMD_REQUEST_DATA);
+    
+    // Send command byte and receive sensor data
+    // Disable interrupts only during actual SPI transfers to prevent conflicts with display/touch
+    noInterrupts();
+    uint8_t cmd_response = hspi.transfer(CMD_REQUEST_DATA);
     
     // Receive sensor data (4 floats = 16 bytes)
-    uint8_t buffer[16];
     for (int i = 0; i < 16; i++) {
         buffer[i] = hspi.transfer(0x00);  // Send dummy byte to receive data
     }
+    interrupts();  // Re-enable interrupts immediately after transfers
     
     hspi.endTransaction();
+    
+    // Deselect slave - pull CS HIGH to deactivate slave
     digitalWrite(SPI_CS_PIN, HIGH);
+    delayMicroseconds(10);  // Small delay to ensure CS is stable HIGH
+    
+    // Debug: Print raw received bytes
+    static unsigned long last_debug = 0;
+    bool should_debug = (millis() - last_debug > 2000);  // Debug every 2 seconds max
+    if (should_debug) {
+        Serial.print("[SPI DEBUG] Raw bytes received: ");
+        for (int i = 0; i < 16; i++) {
+            if (buffer[i] < 0x10) Serial.print("0");
+            Serial.print(buffer[i], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+        last_debug = millis();
+    }
+    
+    // Check if buffer is all zeros or all 0xFF (indicates no valid response)
+    bool all_zeros = true;
+    bool all_ff = true;
+    for (int i = 0; i < 16; i++) {
+        if (buffer[i] != 0x00) all_zeros = false;
+        if (buffer[i] != 0xFF) all_ff = false;
+    }
+    if (all_zeros) {
+        if (should_debug) Serial.println("[SPI DEBUG] Error: Received all zeros (no data)");
+        return false;  // No valid data received
+    }
+    if (all_ff) {
+        if (should_debug) Serial.println("[SPI DEBUG] Error: Received all 0xFF (floating/high-Z)");
+        return false;  // No valid data received
+    }
     
     // Parse received bytes into floats
     // ESP32 is little-endian, so we can memcpy directly
@@ -233,12 +273,46 @@ bool requestSensorData(SensorData* data) {
     memcpy(&data->vibration, &buffer[8], sizeof(float));
     memcpy(&data->current_draw, &buffer[12], sizeof(float));
     
+    // Debug: Print parsed values
+    if (should_debug) {
+        Serial.print("[SPI DEBUG] Parsed values - Oil: ");
+        Serial.print(data->oil_temp);
+        Serial.print("°F, Motor: ");
+        Serial.print(data->motor_temp);
+        Serial.print("°F, Vib: ");
+        Serial.print(data->vibration);
+        Serial.print("g, Current: ");
+        Serial.print(data->current_draw);
+        Serial.println("A");
+    }
+    
     // Check for valid data (basic sanity check)
     if (isnan(data->oil_temp) || isnan(data->motor_temp) || 
         isnan(data->vibration) || isnan(data->current_draw)) {
+        if (should_debug) Serial.println("[SPI DEBUG] Error: NaN detected in parsed values");
         return false;
     }
     
+    // Additional sanity check: values should be reasonable
+    // (assuming your sensor values are in reasonable ranges)
+    if (data->oil_temp < -50.0 || data->oil_temp > 500.0 ||
+        data->motor_temp < -50.0 || data->motor_temp > 500.0 ||
+        data->vibration < 0.0 || data->vibration > 100.0 ||
+        data->current_draw < 0.0 || data->current_draw > 100.0) {
+        if (should_debug) {
+            Serial.print("[SPI DEBUG] Error: Values out of range - Oil: ");
+            Serial.print(data->oil_temp);
+            Serial.print(", Motor: ");
+            Serial.print(data->motor_temp);
+            Serial.print(", Vib: ");
+            Serial.print(data->vibration);
+            Serial.print(", Current: ");
+            Serial.println(data->current_draw);
+        }
+        return false;  // Values out of reasonable range
+    }
+    
+    if (should_debug) Serial.println("[SPI DEBUG] Data valid!");
     return true;
 }
 
@@ -397,7 +471,11 @@ void setup() {
     // Initialize HSPI Master for slave communication (separate from display's VSPI)
     pinMode(SPI_CS_PIN, OUTPUT);
     digitalWrite(SPI_CS_PIN, HIGH);  // CS high = slave not selected
-    hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, SPI_CS_PIN);  // Initialize HSPI bus
+    
+    // Configure MISO pin (GPIO25) with pull-up to prevent floating state issues
+    pinMode(HSPI_MISO, INPUT_PULLUP);
+    
+    hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI);  // Initialize HSPI bus (CS controlled manually)
     Serial.println("HSPI Master initialized");
     Serial.print("HSPI Pins - MOSI: ");
     Serial.print(HSPI_MOSI);
