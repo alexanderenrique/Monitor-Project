@@ -14,11 +14,11 @@
 #define DISPLAY_HEIGHT 320
 
 // SPI Master Configuration (using HSPI bus - separate from display's VSPI)
-#define SPI_CS_PIN 4        // Chip Select pin for SPI slave (adjust if needed)
-#define SD_CS_PIN 15        // Chip Select pin for SD card (adjust if needed)
-#define SPI_FREQ 1000000    // SPI frequency: 1MHz (adjust based on your needs)
+#define SPI_CS_PIN 4        // Chip Select pin for SPI slave (changed from 4 to 15)
+#define SD_CS_PIN 15         // Chip Select pin for SD card (changed from 15 to 4)
+#define SPI_FREQ 10000      // SPI frequency: 10kHz (slow for debugging - each bit takes 100us)
 #define SD_SPI_FREQ 25000000 // SD card SPI frequency: 25MHz (max for most cards)
-#define SPI_POLL_INTERVAL 1000  // Poll slave every 1000ms (1 second)
+#define SPI_POLL_INTERVAL 5000  // Poll slave every 5000ms (5 seconds)
 #define SD_LOG_INTERVAL 900000  // Log to SD card every 15 minutes (900000ms)
 
 // Alarm thresholds
@@ -28,7 +28,7 @@
 
 // HSPI pin definitions (HSPI bus pins on ESP32)
 #define HSPI_MOSI 13        // GPIO13 - HSPI MOSI
-#define HSPI_MISO 25        // GPIO25 - HSPI MISO (changed from GPIO12 to avoid boot strap issues)
+#define HSPI_MISO 25        // GPIO25 - HSPI MISO (changed from GPIO12 to avoid boot strapping)
 #define HSPI_SCK 14         // GPIO14 - HSPI Clock
 
 // SPI Command codes
@@ -207,38 +207,242 @@ void create_monitoring_screen() {
     lv_obj_set_pos(current_draw_value_label, 20, start_y + field_spacing * 3 + 25);
 }
 
-// Request sensor data from SPI slave (using HSPI bus)
-bool requestSensorData(SensorData* data) {
-    // Initialize buffer to zeros for safety
+// Super simple serial protocol - no strict timing, just long delays for stability
+// 10ms per bit = 80ms per byte (very slow but very stable over 2m wire)
+// No edge detection, no strict timing - just set data, wait, toggle clock, wait, read
+uint8_t simpleSerialTransfer(uint8_t data) {
+    uint8_t response = 0;
+    
+    // Send/receive 8 bits MSB first
+    for (int i = 7; i >= 0; i--) {
+        // Set MOSI bit
+        digitalWrite(HSPI_MOSI, (data >> i) & 0x01);
+        delay(10);  // 10ms - plenty of time for signal to propagate 2m
+        
+        // Toggle SCK HIGH (just a signal, not strict timing)
+        digitalWrite(HSPI_SCK, HIGH);
+        delay(10);  // 10ms - slave has time to read MOSI and set MISO
+        
+        // Read MISO (slave should have set it by now)
+        response |= (digitalRead(HSPI_MISO) << i);
+        
+        // Toggle SCK LOW
+        digitalWrite(HSPI_SCK, LOW);
+        delay(10);  // 10ms - prepare for next bit
+    }
+    
+    return response;
+}
+
+// Request sensor data from SPI slave (using BIT-BANG SPI for testing)
+bool requestSensorDataBitBang(SensorData* data) {
     uint8_t buffer[16] = {0};
     
-    // Select slave - pull CS LOW to activate slave
-    digitalWrite(SPI_CS_PIN, LOW);
-    delayMicroseconds(10);  // Small delay for slave to be ready
+    Serial.println("\n=== MASTER SIMPLE SERIAL TRANSACTION START ===");
     
-    // Send command to request data using HSPI
+    // Configure pins manually
+    pinMode(HSPI_MOSI, OUTPUT);
+    pinMode(HSPI_SCK, OUTPUT);
+    pinMode(HSPI_MISO, INPUT);
+    pinMode(SPI_CS_PIN, OUTPUT);
+    
+    // Set initial states
+    digitalWrite(HSPI_MOSI, LOW);
+    digitalWrite(HSPI_SCK, LOW);  // Start with clock LOW
+    digitalWrite(SPI_CS_PIN, HIGH);
+    
+    Serial.print("[SIMPLE] Initial pin states - CS: ");
+    Serial.print(digitalRead(SPI_CS_PIN) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    
+    // Pull CS LOW
+    Serial.println("[SIMPLE] Pulling CS LOW...");
+    digitalWrite(SPI_CS_PIN, LOW);
+    delay(20);  // 20ms - give slave plenty of time to detect (was 100µs)
+    
+    // Send command byte
+    Serial.print("[SIMPLE] Sending command: 0x");
+    Serial.println(CMD_REQUEST_DATA, HEX);
+    uint8_t cmd_response = simpleSerialTransfer(CMD_REQUEST_DATA);
+    Serial.print("[SIMPLE] Received response: 0x");
+    Serial.println(cmd_response, HEX);
+    
+    // Receive 16 bytes
+    Serial.println("[SIMPLE] Receiving 16 bytes...");
+    for (int i = 0; i < 16; i++) {
+        buffer[i] = simpleSerialTransfer(0x00);
+        if (i < 4) {
+            Serial.print("[BIT-BANG] Byte ");
+            Serial.print(i);
+            Serial.print(": 0x");
+            if (buffer[i] < 0x10) Serial.print("0");
+            Serial.println(buffer[i], HEX);
+        }
+    }
+    
+    // Release CS
+    digitalWrite(SPI_CS_PIN, HIGH);
+    delay(20);  // 20ms - give slave time to finish (was 100µs)
+    
+    Serial.println("=== MASTER SIMPLE SERIAL TRANSACTION END ===\n");
+    
+    // Validate data
+    bool all_ff = true;
+    for (int i = 0; i < 16; i++) {
+        if (buffer[i] != 0xFF) all_ff = false;
+    }
+    if (all_ff) {
+        Serial.println("[SIMPLE] Error: Received all 0xFF");
+        return false;
+    }
+    
+    memcpy(&data->oil_temp, &buffer[0], sizeof(float));
+    memcpy(&data->motor_temp, &buffer[4], sizeof(float));
+    memcpy(&data->vibration, &buffer[8], sizeof(float));
+    memcpy(&data->current_draw, &buffer[12], sizeof(float));
+    
+    return true;
+}
+
+// Request sensor data from SPI slave (using HSPI bus)
+bool requestSensorData(SensorData* data) {
+    uint8_t buffer[16] = {0};
+    
+    Serial.println("\n=== MASTER SPI TRANSACTION START ===");
+    
+    // Check initial pin states
+    Serial.print("[MASTER] Initial pin states - CS: ");
+    Serial.print(digitalRead(SPI_CS_PIN) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    
+    // Pull CS LOW to select slave
+    Serial.println("[MASTER] Pulling CS LOW...");
+    digitalWrite(SPI_CS_PIN, LOW);
+    delayMicroseconds(50);
+    
+    Serial.print("[MASTER] After CS LOW - CS: ");
+    Serial.print(digitalRead(SPI_CS_PIN) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    
+    // Begin SPI transaction with proper settings
+    Serial.print("[MASTER] Beginning SPI transaction - Freq: ");
+    Serial.print(SPI_FREQ);
+    Serial.println(" Hz, Mode: MODE0");
     hspi.beginTransaction(SPISettings(SPI_FREQ, MSBFIRST, SPI_MODE0));
     
-    // Send command byte and receive sensor data
-    // Disable interrupts only during actual SPI transfers to prevent conflicts with display/touch
-    noInterrupts();
-    uint8_t cmd_response = hspi.transfer(CMD_REQUEST_DATA);
+    Serial.print("[MASTER] After beginTransaction - MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
     
-    // Receive sensor data (4 floats = 16 bytes)
-    for (int i = 0; i < 16; i++) {
-        buffer[i] = hspi.transfer(0x00);  // Send dummy byte to receive data
+    // Send command and receive response
+    Serial.print("[MASTER] Sending command byte: 0x");
+    Serial.print(CMD_REQUEST_DATA, HEX);
+    Serial.println(" (0x01)");
+    
+    // Sample SCK before transfer to see if it toggles
+    bool sck_samples_before[5];
+    for (int i = 0; i < 5; i++) {
+        sck_samples_before[i] = digitalRead(HSPI_SCK);
+        delayMicroseconds(2);
     }
-    interrupts();  // Re-enable interrupts immediately after transfers
+    Serial.print("[MASTER] SCK samples before transfer: ");
+    for (int i = 0; i < 5; i++) {
+        Serial.print(sck_samples_before[i] == LOW ? "L" : "H");
+    }
+    Serial.println();
     
+    unsigned long transfer_start = micros();
+    uint8_t cmd_response = hspi.transfer(CMD_REQUEST_DATA);
+    unsigned long transfer_duration = micros() - transfer_start;
+    
+    // Sample SCK after transfer
+    bool sck_samples_after[5];
+    for (int i = 0; i < 5; i++) {
+        sck_samples_after[i] = digitalRead(HSPI_SCK);
+        delayMicroseconds(2);
+    }
+    Serial.print("[MASTER] SCK samples after transfer: ");
+    for (int i = 0; i < 5; i++) {
+        Serial.print(sck_samples_after[i] == LOW ? "L" : "H");
+    }
+    Serial.print(" | Transfer duration: ");
+    Serial.print(transfer_duration);
+    Serial.println(" us");
+    
+    Serial.print("[MASTER] After first transfer - MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.print(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    Serial.print(" | Received: 0x");
+    Serial.println(cmd_response, HEX);
+    
+    // Small delay to ensure slave processes command
+    delayMicroseconds(10);
+    
+    // Receive 16 bytes of sensor data
+    Serial.println("[MASTER] Receiving 16 bytes of data...");
+    for (int i = 0; i < 16; i++) {
+        unsigned long byte_start = micros();
+        buffer[i] = hspi.transfer(0x00);
+        unsigned long byte_duration = micros() - byte_start;
+        if (i < 4) {  // Debug first 4 bytes
+            Serial.print("[MASTER] Byte ");
+            Serial.print(i);
+            Serial.print(": 0x");
+            if (buffer[i] < 0x10) Serial.print("0");
+            Serial.print(buffer[i], HEX);
+            Serial.print(" (");
+            Serial.print(byte_duration);
+            Serial.println(" us)");
+        }
+    }
+    
+    // End transaction before releasing CS
+    Serial.println("[MASTER] Ending SPI transaction...");
     hspi.endTransaction();
     
-    // Deselect slave - pull CS HIGH to deactivate slave
-    digitalWrite(SPI_CS_PIN, HIGH);
-    delayMicroseconds(10);  // Small delay to ensure CS is stable HIGH
+    Serial.print("[MASTER] After endTransaction - MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
     
-    // Debug: Print raw received bytes
+    // Small delay before releasing CS
+    delayMicroseconds(10);
+    
+    // Release CS (pull HIGH)
+    Serial.println("[MASTER] Releasing CS (pulling HIGH)...");
+    digitalWrite(SPI_CS_PIN, HIGH);
+    
+    // Give slave time to process CS going HIGH
+    delayMicroseconds(50);
+    
+    Serial.print("[MASTER] Final pin states - CS: ");
+    Serial.print(digitalRead(SPI_CS_PIN) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.println(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    
+    Serial.print("[MASTER] Command response: 0x");
+    Serial.println(cmd_response, HEX);
     static unsigned long last_debug = 0;
-    bool should_debug = (millis() - last_debug > 2000);  // Debug every 2 seconds max
+    bool should_debug = (millis() - last_debug > 2000);
     if (should_debug) {
         Serial.print("[SPI DEBUG] Raw bytes received: ");
         for (int i = 0; i < 16; i++) {
@@ -249,8 +453,6 @@ bool requestSensorData(SensorData* data) {
         Serial.println();
         last_debug = millis();
     }
-    
-    // Check if buffer is all zeros or all 0xFF (indicates no valid response)
     bool all_zeros = true;
     bool all_ff = true;
     for (int i = 0; i < 16; i++) {
@@ -259,60 +461,33 @@ bool requestSensorData(SensorData* data) {
     }
     if (all_zeros) {
         if (should_debug) Serial.println("[SPI DEBUG] Error: Received all zeros (no data)");
-        return false;  // No valid data received
+        return false;
     }
     if (all_ff) {
         if (should_debug) Serial.println("[SPI DEBUG] Error: Received all 0xFF (floating/high-Z)");
-        return false;  // No valid data received
+        return false;
     }
-    
-    // Parse received bytes into floats
-    // ESP32 is little-endian, so we can memcpy directly
     memcpy(&data->oil_temp, &buffer[0], sizeof(float));
     memcpy(&data->motor_temp, &buffer[4], sizeof(float));
     memcpy(&data->vibration, &buffer[8], sizeof(float));
     memcpy(&data->current_draw, &buffer[12], sizeof(float));
-    
-    // Debug: Print parsed values
     if (should_debug) {
-        Serial.print("[SPI DEBUG] Parsed values - Oil: ");
-        Serial.print(data->oil_temp);
-        Serial.print("°F, Motor: ");
-        Serial.print(data->motor_temp);
-        Serial.print("°F, Vib: ");
-        Serial.print(data->vibration);
-        Serial.print("g, Current: ");
-        Serial.print(data->current_draw);
-        Serial.println("A");
+        Serial.print("[SPI DEBUG] Parsed values - Oil: "); Serial.print(data->oil_temp); Serial.print("°F, Motor: ");
+        Serial.print(data->motor_temp); Serial.print("°F, Vib: ");
+        Serial.print(data->vibration); Serial.print("g, Current: ");
+        Serial.print(data->current_draw); Serial.println("A");
     }
-    
-    // Check for valid data (basic sanity check)
-    if (isnan(data->oil_temp) || isnan(data->motor_temp) || 
-        isnan(data->vibration) || isnan(data->current_draw)) {
+    if (isnan(data->oil_temp) || isnan(data->motor_temp) || isnan(data->vibration) || isnan(data->current_draw)) {
         if (should_debug) Serial.println("[SPI DEBUG] Error: NaN detected in parsed values");
         return false;
     }
-    
-    // Additional sanity check: values should be reasonable
-    // (assuming your sensor values are in reasonable ranges)
     if (data->oil_temp < -50.0 || data->oil_temp > 500.0 ||
         data->motor_temp < -50.0 || data->motor_temp > 500.0 ||
         data->vibration < 0.0 || data->vibration > 100.0 ||
         data->current_draw < 0.0 || data->current_draw > 100.0) {
-        if (should_debug) {
-            Serial.print("[SPI DEBUG] Error: Values out of range - Oil: ");
-            Serial.print(data->oil_temp);
-            Serial.print(", Motor: ");
-            Serial.print(data->motor_temp);
-            Serial.print(", Vib: ");
-            Serial.print(data->vibration);
-            Serial.print(", Current: ");
-            Serial.println(data->current_draw);
-        }
-        return false;  // Values out of reasonable range
+        if (should_debug) Serial.println("[SPI DEBUG] Error: Values out of reasonable range");
+        return false;
     }
-    
-    if (should_debug) Serial.println("[SPI DEBUG] Data valid!");
     return true;
 }
 
@@ -472,11 +647,30 @@ void setup() {
     pinMode(SPI_CS_PIN, OUTPUT);
     digitalWrite(SPI_CS_PIN, HIGH);  // CS high = slave not selected
     
-    // Configure MISO pin (GPIO25) with pull-up to prevent floating state issues
+    // Configure HSPI pins explicitly before begin()
+    pinMode(HSPI_MOSI, OUTPUT);
+    pinMode(HSPI_SCK, OUTPUT);
     pinMode(HSPI_MISO, INPUT_PULLUP);
     
-    hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI);  // Initialize HSPI bus (CS controlled manually)
+    // Set initial states
+    digitalWrite(HSPI_MOSI, LOW);
+    digitalWrite(HSPI_SCK, LOW);
+    
+    // CRITICAL: CS pin should NOT be passed to begin() for master mode
+    // CS must be controlled manually via digitalWrite()
+    hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, -1);  // Initialize HSPI bus (CS=-1 means manual control)
+    
     Serial.println("HSPI Master initialized");
+    
+    // Verify pin states after initialization
+    Serial.print("[MASTER INIT] Pin states - MOSI: ");
+    Serial.print(digitalRead(HSPI_MOSI) == LOW ? "LOW" : "HIGH");
+    Serial.print(", SCK: ");
+    Serial.print(digitalRead(HSPI_SCK) == LOW ? "LOW" : "HIGH");
+    Serial.print(", MISO: ");
+    Serial.print(digitalRead(HSPI_MISO) == LOW ? "LOW" : "HIGH");
+    Serial.print(", CS: ");
+    Serial.println(digitalRead(SPI_CS_PIN) == LOW ? "LOW" : "HIGH");
     Serial.print("HSPI Pins - MOSI: ");
     Serial.print(HSPI_MOSI);
     Serial.print(", MISO: ");
@@ -561,7 +755,8 @@ void loop() {
         last_poll_time = current_time;
         
         SensorData sensor_data;
-        if (requestSensorData(&sensor_data)) {
+        // Use bit-bang SPI to test connections
+        if (requestSensorDataBitBang(&sensor_data)) {
             // Check for alarm conditions
             bool alarm = checkAlarmConditions(sensor_data);
             
@@ -619,4 +814,3 @@ void loop() {
     // Small delay to prevent watchdog issues
     delay(5);
 }
-
