@@ -4,6 +4,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 // LVGL display buffer size
 #define LVGL_BUFFER_SIZE 10 * 1024
@@ -20,6 +22,10 @@
 #define SD_SPI_FREQ 25000000 // SD card SPI frequency: 25MHz (max for most cards)
 #define SD_LOG_INTERVAL 900000  // Log to SD card every 15 minutes (900000ms)
 
+// I2C Configuration for DS3231 RTC
+#define I2C_SDA_PIN 21       // GPIO 21 - SDA pin for I2C
+#define I2C_SCL_PIN 22       // GPIO 22 - SCL pin for I2C
+
 // Alarm thresholds
 #define TEMP_MIN 30.0       // Minimum temperature (°F) - alarm if below
 #define VIBRATION_MAX 10.0  // Maximum vibration (g) - alarm if above
@@ -27,6 +33,9 @@
 
 // UART instance for slave communication (Serial2 = UART2, RX only)
 HardwareSerial SlaveUART(2);
+
+// RTC instance
+RTC_DS3231 rtc;
 
 // SD card logging timer
 unsigned long last_sd_log_time = 0;
@@ -38,6 +47,9 @@ bool alarm_acknowledged = false;
 
 // Function forward declarations
 void logAcknowledgmentToSD();
+void updateTimeDisplay();
+void setRTCTime(int year, int month, int day, int hour, int minute, int second);
+void checkSerialCommands();
 
 // TFT_eSPI instance
 TFT_eSPI tft = TFT_eSPI();
@@ -111,6 +123,7 @@ void touch_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
 }
 
 // Global labels for values (so we can update them in loop())
+static lv_obj_t *time_label;
 static lv_obj_t *oil_temp_label;
 static lv_obj_t *oil_temp_value_label;
 static lv_obj_t *motor_temp_label;
@@ -147,6 +160,12 @@ void create_monitoring_screen() {
     lv_style_init(&value_style);
     lv_style_set_text_color(&value_style, LV_COLOR_MAKE(0, 0, 0));  // Black text
     lv_style_set_text_font(&value_style, &lv_font_montserrat_24);  // Larger font for values (24 is enabled)
+    
+    // Time display at the top
+    time_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(time_label, "--:--:--");
+    lv_obj_add_style(time_label, &value_style, 0);
+    lv_obj_set_pos(time_label, 20, 5);
     
     // Calculate spacing for 4 fields on 320px height display
     int start_y = 30;
@@ -269,6 +288,7 @@ void updateDisplayColors(bool alarm) {
     lv_obj_set_style_bg_color(lv_scr_act(), bg_color, 0);
     
     // Update text colors on all labels (both field names and values)
+    lv_obj_set_style_text_color(time_label, text_color, 0);
     lv_obj_set_style_text_color(oil_temp_label, text_color, 0);
     lv_obj_set_style_text_color(oil_temp_value_label, text_color, 0);
     lv_obj_set_style_text_color(motor_temp_label, text_color, 0);
@@ -319,10 +339,23 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
     
     File dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
     if (dataFile) {
-        // CSV format: timestamp, oil_temp, motor_temp, vibration, current_draw, alarm_flag
+        // CSV format: timestamp, datetime, oil_temp, motor_temp, vibration, current_draw, alarm_flag
         unsigned long timestamp = millis() / 1000;  // Seconds since boot
         
+        // Add RTC datetime if available
+        String datetime_str = "";
+        if (rtc.begin()) {
+            DateTime now = rtc.now();
+            char dt_buf[32];
+            snprintf(dt_buf, sizeof(dt_buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                    now.year(), now.month(), now.day(),
+                    now.hour(), now.minute(), now.second());
+            datetime_str = String(dt_buf);
+        }
+        
         dataFile.print(timestamp);
+        dataFile.print(",");
+        dataFile.print(datetime_str);
         dataFile.print(",");
         dataFile.print(data.oil_temp, 2);
         dataFile.print(",");
@@ -377,6 +410,84 @@ void logAcknowledgmentToSD() {
     }
 }
 
+// Update time display from RTC
+void updateTimeDisplay() {
+    if (!rtc.begin()) {
+        return;  // RTC not available
+    }
+    
+    DateTime now = rtc.now();
+    char time_str[16];
+    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    lv_label_set_text(time_label, time_str);
+}
+
+// Set RTC time (called from Serial commands)
+void setRTCTime(int year, int month, int day, int hour, int minute, int second) {
+    if (!rtc.begin()) {
+        Serial.println("ERROR: RTC not initialized!");
+        return;
+    }
+    
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    Serial.print("RTC time set to: ");
+    Serial.print(year);
+    Serial.print("/");
+    Serial.print(month);
+    Serial.print("/");
+    Serial.print(day);
+    Serial.print(" ");
+    Serial.print(hour);
+    Serial.print(":");
+    Serial.print(minute);
+    Serial.print(":");
+    Serial.println(second);
+}
+
+// Check for Serial commands to set time
+void checkSerialCommands() {
+    if (Serial.available() > 0) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+        
+        // Command format: SETTIME YYYY MM DD HH MM SS
+        if (command.startsWith("SETTIME ")) {
+            int year, month, day, hour, minute, second;
+            if (sscanf(command.c_str(), "SETTIME %d %d %d %d %d %d", 
+                      &year, &month, &day, &hour, &minute, &second) == 6) {
+                setRTCTime(year, month, day, hour, minute, second);
+            } else {
+                Serial.println("ERROR: Invalid SETTIME format. Use: SETTIME YYYY MM DD HH MM SS");
+            }
+        }
+        // Command: SETTIME_NOW - sets RTC to compile time
+        else if (command == "SETTIME_NOW") {
+            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+            Serial.println("RTC set to compile time");
+        }
+        // Command: SHOWTIME - displays current RTC time
+        else if (command == "SHOWTIME") {
+            if (rtc.begin()) {
+                DateTime now = rtc.now();
+                Serial.print("Current RTC time: ");
+                Serial.print(now.year());
+                Serial.print("/");
+                Serial.print(now.month());
+                Serial.print("/");
+                Serial.print(now.day());
+                Serial.print(" ");
+                Serial.print(now.hour());
+                Serial.print(":");
+                Serial.print(now.minute());
+                Serial.print(":");
+                Serial.println(now.second());
+            } else {
+                Serial.println("ERROR: RTC not initialized!");
+            }
+        }
+    }
+}
+
 void setup() {
     Serial.begin(9600);
     delay(1000);
@@ -413,6 +524,48 @@ void setup() {
     Serial.print("UART Baud Rate: ");
     Serial.println(UART_BAUD);
     
+    // Initialize I2C for DS3231 RTC
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Serial.println("I2C initialized");
+    Serial.print("I2C SDA Pin: GPIO ");
+    Serial.println(I2C_SDA_PIN);
+    Serial.print("I2C SCL Pin: GPIO ");
+    Serial.println(I2C_SCL_PIN);
+    
+    // Initialize DS3231 RTC
+    if (!rtc.begin()) {
+        Serial.println("ERROR: Couldn't find RTC!");
+        Serial.println("RTC will not be available");
+    } else {
+        Serial.println("DS3231 RTC initialized successfully");
+        
+        // Check if RTC lost power and set to compile time if needed
+        if (rtc.lostPower()) {
+            Serial.println("RTC lost power - setting to compile time");
+            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        }
+        
+        // Display current RTC time
+        DateTime now = rtc.now();
+        Serial.print("Current RTC time: ");
+        Serial.print(now.year());
+        Serial.print("/");
+        Serial.print(now.month());
+        Serial.print("/");
+        Serial.print(now.day());
+        Serial.print(" ");
+        Serial.print(now.hour());
+        Serial.print(":");
+        Serial.print(now.minute());
+        Serial.print(":");
+        Serial.println(now.second());
+        
+        Serial.println("\nTo set RTC time via Serial:");
+        Serial.println("  SETTIME YYYY MM DD HH MM SS");
+        Serial.println("  SETTIME_NOW (sets to compile time)");
+        Serial.println("  SHOWTIME (displays current time)");
+    }
+    
     // Initialize SD card on HSPI bus
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);  // CS high = SD card not selected
@@ -425,19 +578,19 @@ void setup() {
         sd_card_initialized = true;
         Serial.println("SD card initialized successfully");
         
-        // Create CSV header if file doesn't exist
-        File dataFile = SD.open("/sensor_log.csv", FILE_READ);
-        if (!dataFile) {
-            // File doesn't exist, create it with header
-            dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
-            if (dataFile) {
-                dataFile.println("timestamp,oil_temp,motor_temp,vibration,current_draw,status");
+            // Create CSV header if file doesn't exist
+            File dataFile = SD.open("/sensor_log.csv", FILE_READ);
+            if (!dataFile) {
+                // File doesn't exist, create it with header
+                dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
+                if (dataFile) {
+                    dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
+                    dataFile.close();
+                    Serial.println("Created sensor_log.csv with header");
+                }
+            } else {
                 dataFile.close();
-                Serial.println("Created sensor_log.csv with header");
             }
-        } else {
-            dataFile.close();
-        }
     } else {
         sd_card_initialized = false;
         Serial.println("SD card initialization failed - logging disabled");
@@ -478,6 +631,16 @@ void loop() {
     // Handle LVGL tasks (call this as frequently as possible)
     // LVGL 8.3.11 uses lv_task_handler(), not lv_timer_handler() (that's LVGL 9+)
     lv_task_handler();
+    
+    // Check for Serial commands (time setting, etc.)
+    checkSerialCommands();
+    
+    // Update time display every second
+    static unsigned long last_time_update = 0;
+    if (millis() - last_time_update >= 1000) {
+        updateTimeDisplay();
+        last_time_update = millis();
+    }
     
     // Check for incoming sensor data from slave (UART hardware detects when data arrives)
     SensorData sensor_data;
