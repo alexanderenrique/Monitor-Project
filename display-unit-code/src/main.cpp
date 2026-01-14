@@ -161,9 +161,9 @@ void create_monitoring_screen() {
     lv_style_set_text_color(&value_style, LV_COLOR_MAKE(0, 0, 0));  // Black text
     lv_style_set_text_font(&value_style, &lv_font_montserrat_24);  // Larger font for values (24 is enabled)
     
-    // Time display at the top
+    // Date and time display at the top
     time_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(time_label, "--:--:--");
+    lv_label_set_text(time_label, "--/--/----\n--:--:--");
     lv_obj_add_style(time_label, &value_style, 0);
     lv_obj_set_pos(time_label, 20, 5);
     
@@ -417,9 +417,12 @@ void updateTimeDisplay() {
     }
     
     DateTime now = rtc.now();
-    char time_str[16];
-    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-    lv_label_set_text(time_label, time_str);
+    char datetime_str[32];
+    // Format: MM/DD/YYYY on first line, HH:MM:SS on second line
+    snprintf(datetime_str, sizeof(datetime_str), "%02d/%02d/%04d\n%02d:%02d:%02d", 
+             now.month(), now.day(), now.year(),
+             now.hour(), now.minute(), now.second());
+    lv_label_set_text(time_label, datetime_str);
 }
 
 // Set RTC time (called from Serial commands)
