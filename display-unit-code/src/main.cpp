@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include "touch_mapping.h"
 
 // LVGL display buffer size
 #define LVGL_BUFFER_SIZE 10 * 1024
@@ -45,11 +46,20 @@ bool sd_card_initialized = false;
 bool alarm_active = false;
 bool alarm_acknowledged = false;
 
+// RTC time set flag
+bool rtc_time_set = false;
+
 // Function forward declarations
 void logAcknowledgmentToSD();
 void updateTimeDisplay();
 void setRTCTime(int year, int month, int day, int hour, int minute, int second);
 void checkSerialCommands();
+bool isRTCTimeSet();
+void create_time_entry_screen();
+void show_monitoring_screen();
+static void time_entry_btn_event_handler(lv_event_t * e);
+static void arrow_btn_event_handler(lv_event_t * e);
+void update_time_entry_display();
 
 // TFT_eSPI instance
 TFT_eSPI tft = TFT_eSPI();
@@ -94,9 +104,39 @@ void touch_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
     #endif
     
     if (touched) {
+        // TFT_eSPI getTouch() should handle rotation automatically, but we may need to
+        // apply additional calibration based on your specific touch controller
+        
         // Clamp coordinates to display bounds to prevent LVGL warnings
         if (x >= DISPLAY_WIDTH) x = DISPLAY_WIDTH - 1;
         if (y >= DISPLAY_HEIGHT) y = DISPLAY_HEIGHT - 1;
+        
+        // Store raw coordinates for debugging
+        uint16_t raw_x = x;
+        uint16_t raw_y = y;
+        
+        // Apply coordinate transformation if needed
+        // With TFT_ROTATION 0 (portrait), coordinates should already be correct
+        // But some touch controllers need manual transformation
+        
+        // If touch coordinates seem swapped or inverted, uncomment and adjust:
+        // For portrait mode, if X and Y are swapped:
+        // uint16_t temp = x;
+        // x = y;
+        // y = temp;
+        // If Y axis is inverted:
+        // y = DISPLAY_HEIGHT - y;
+        
+        // COMMENTED OUT: Touch mapping for time entry screen disabled
+        // Try to map touch to button first (for time entry screen)
+        // if (map_touch_to_button(x, y)) {
+        //     // Touch was mapped to a button, but we still need to provide valid data to LVGL
+        //     // Use a coordinate that won't interfere (e.g., off-screen or neutral position)
+        //     data->point.x = 0;
+        //     data->point.y = 0;
+        //     data->state = LV_INDEV_STATE_RELEASED;  // Set to released so LVGL doesn't process it
+        //     return;
+        // }
         
         data->point.x = x;
         data->point.y = y;
@@ -111,10 +151,42 @@ void touch_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
             logAcknowledgmentToSD();
         }
         
-        Serial.print("Touch - X: ");
+        // Debug output - show both raw and processed coordinates
+        Serial.print("[TOUCH] Raw: (");
+        Serial.print(raw_x);
+        Serial.print(", ");
+        Serial.print(raw_y);
+        Serial.print(") -> LVGL: (");
         Serial.print(x);
-        Serial.print(", Y: ");
-        Serial.println(y);
+        Serial.print(", ");
+        Serial.print(y);
+        Serial.print(")");
+        
+        // Check if touch is near any button areas (for debugging)
+        // Expanded ranges to account for coordinate offset
+        // Year buttons: x=55-90, y=62-127 (UP at 60-85/67-92, DOWN at 60-85/97-122)
+        // Month buttons: x=130-165, y=62-127
+        // Day buttons: x=205-240, y=62-127
+        // Hour buttons: x=55-90, y=132-197
+        // Minute buttons: x=130-165, y=132-197
+        // Second buttons: x=205-240, y=132-197
+        // Set Time button: x=15-225, y=180-230
+        
+        bool near_button = false;
+        if ((x >= 55 && x <= 90) || (x >= 130 && x <= 165) || (x >= 205 && x <= 240)) {
+            if ((y >= 62 && y <= 127) || (y >= 132 && y <= 197)) {
+                near_button = true;
+                Serial.print(" [NEAR ARROW BUTTON]");
+            }
+        }
+        if (x >= 15 && x <= 225 && y >= 180 && y <= 230) {
+            near_button = true;
+            Serial.print(" [NEAR SET TIME BUTTON]");
+        }
+        if (!near_button) {
+            Serial.print(" [NOT NEAR BUTTON]");
+        }
+        Serial.println();
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
         data->point.x = 0;
@@ -133,6 +205,34 @@ static lv_obj_t *vibration_value_label;
 static lv_obj_t *current_draw_label;
 static lv_obj_t *current_draw_value_label;
 
+// Time entry screen objects
+lv_obj_t *time_entry_screen;  // Made non-static so touch_mapping.cpp can access it
+static lv_obj_t *year_label;
+static lv_obj_t *month_label;
+static lv_obj_t *day_label;
+static lv_obj_t *hour_label;
+static lv_obj_t *minute_label;
+static lv_obj_t *second_label;
+lv_obj_t *set_time_btn;  // Made non-static so touch_mapping.cpp can access it
+
+// Arrow buttons for each field
+// Made non-static so touch_mapping.cpp can access them
+lv_obj_t *year_up_btn, *year_down_btn;
+lv_obj_t *month_up_btn, *month_down_btn;
+lv_obj_t *day_up_btn, *day_down_btn;
+lv_obj_t *hour_up_btn, *hour_down_btn;
+lv_obj_t *minute_up_btn, *minute_down_btn;
+lv_obj_t *second_up_btn, *second_down_btn;
+
+// Current time values
+// Note: current_year stores 2-digit year (0-99), will be converted to 20xx when setting RTC
+static int current_year = 24;  // 2-digit year (24 = 2024)
+static int current_month = 12;
+static int current_day = 15;
+static int current_hour = 12;
+static int current_minute = 0;
+static int current_second = 0;
+
 // Sensor data structure (matches what slave will send)
 struct SensorData {
     float oil_temp;      // Oil temperature in Fahrenheit
@@ -146,6 +246,8 @@ struct SensorData {
 // Global styles (so we can change them for alarm mode)
 static lv_style_t label_style;
 static lv_style_t value_style;
+static lv_style_t input_style;
+static lv_style_t header_style;
 
 // Create monitoring display screen
 void create_monitoring_screen() {
@@ -214,6 +316,573 @@ void create_monitoring_screen() {
     lv_label_set_text(current_draw_value_label, "-- A");
     lv_obj_add_style(current_draw_value_label, &value_style, 0);
     lv_obj_set_pos(current_draw_value_label, 20, start_y + field_spacing * 3 + 25);
+}
+
+// Helper function to create up/down arrow buttons
+static void create_arrow_buttons(lv_obj_t *parent, lv_obj_t **up_btn, lv_obj_t **down_btn, 
+                                  int x, int y, int btn_size) {
+    // Up arrow button
+    *up_btn = lv_btn_create(parent);
+    lv_obj_set_size(*up_btn, btn_size, btn_size);
+    lv_obj_set_pos(*up_btn, x, y);
+    
+    // Buttons are clickable by default in LVGL - add event callbacks
+    // Try multiple event types to see what works
+    lv_obj_add_event_cb(*up_btn, arrow_btn_event_handler, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(*up_btn, arrow_btn_event_handler, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(*up_btn, arrow_btn_event_handler, LV_EVENT_RELEASED, NULL);
+    
+    lv_obj_t *up_label = lv_label_create(*up_btn);
+    lv_label_set_text(up_label, LV_SYMBOL_UP);
+    lv_obj_center(up_label);
+    
+    Serial.print("[DEBUG] Created UP button at (");
+    Serial.print(x);
+    Serial.print(", ");
+    Serial.print(y);
+    Serial.print("), size: ");
+    Serial.print(btn_size);
+    Serial.print(", covers area: x=");
+    Serial.print(x);
+    Serial.print("-");
+    Serial.print(x + btn_size);
+    Serial.print(", y=");
+    Serial.print(y);
+    Serial.print("-");
+    Serial.print(y + btn_size);
+    Serial.print(", pointer: 0x");
+    Serial.print((uint32_t)*up_btn, HEX);
+    Serial.print(", parent: 0x");
+    Serial.println((uint32_t)parent, HEX);
+    
+    // Down arrow button - increase spacing to avoid overlap
+    int down_y = y + btn_size + 10;  // Increased from 5 to 10 pixels spacing
+    *down_btn = lv_btn_create(parent);
+    lv_obj_set_size(*down_btn, btn_size, btn_size);
+    lv_obj_set_pos(*down_btn, x, down_y);
+    
+    // Buttons are clickable by default in LVGL - add event callbacks
+    // Try multiple event types to see what works
+    lv_obj_add_event_cb(*down_btn, arrow_btn_event_handler, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(*down_btn, arrow_btn_event_handler, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(*down_btn, arrow_btn_event_handler, LV_EVENT_RELEASED, NULL);
+    
+    lv_obj_t *down_label = lv_label_create(*down_btn);
+    lv_label_set_text(down_label, LV_SYMBOL_DOWN);
+    lv_obj_center(down_label);
+    
+    Serial.print("[DEBUG] Created DOWN button at (");
+    Serial.print(x);
+    Serial.print(", ");
+    Serial.print(down_y);
+    Serial.print("), size: ");
+    Serial.print(btn_size);
+    Serial.print(", covers area: x=");
+    Serial.print(x);
+    Serial.print("-");
+    Serial.print(x + btn_size);
+    Serial.print(", y=");
+    Serial.print(down_y);
+    Serial.print("-");
+    Serial.print(down_y + btn_size);
+    Serial.print(", pointer: 0x");
+    Serial.print((uint32_t)*down_btn, HEX);
+    Serial.print(", parent: 0x");
+    Serial.println((uint32_t)parent, HEX);
+}
+
+// Update time entry display labels
+void update_time_entry_display() {
+    char buf[16];
+    
+    Serial.print("[DEBUG] update_time_entry_display() - Current values: ");
+    Serial.print(current_year);
+    Serial.print("/");
+    Serial.print(current_month);
+    Serial.print("/");
+    Serial.print(current_day);
+    Serial.print(" ");
+    Serial.print(current_hour);
+    Serial.print(":");
+    Serial.print(current_minute);
+    Serial.print(":");
+    Serial.println(current_second);
+    
+    // Display year as 2 digits (last 2 digits of year)
+    int year_2digit = current_year % 100;
+    snprintf(buf, sizeof(buf), "%02d", year_2digit);
+    lv_label_set_text(year_label, buf);
+    Serial.print("[DEBUG] Year label updated to: ");
+    Serial.print(buf);
+    Serial.print(" (full year: ");
+    Serial.print(current_year);
+    Serial.println(")");
+    
+    snprintf(buf, sizeof(buf), "%02d", current_month);
+    lv_label_set_text(month_label, buf);
+    Serial.print("[DEBUG] Month label updated to: ");
+    Serial.println(buf);
+    
+    snprintf(buf, sizeof(buf), "%02d", current_day);
+    lv_label_set_text(day_label, buf);
+    Serial.print("[DEBUG] Day label updated to: ");
+    Serial.println(buf);
+    
+    snprintf(buf, sizeof(buf), "%02d", current_hour);
+    lv_label_set_text(hour_label, buf);
+    Serial.print("[DEBUG] Hour label updated to: ");
+    Serial.println(buf);
+    
+    snprintf(buf, sizeof(buf), "%02d", current_minute);
+    lv_label_set_text(minute_label, buf);
+    Serial.print("[DEBUG] Minute label updated to: ");
+    Serial.println(buf);
+    
+    snprintf(buf, sizeof(buf), "%02d", current_second);
+    lv_label_set_text(second_label, buf);
+    Serial.print("[DEBUG] Second label updated to: ");
+    Serial.println(buf);
+    
+    Serial.println("[DEBUG] All labels updated, forcing refresh");
+    lv_refr_now(NULL);
+}
+
+// Create time entry screen
+void create_time_entry_screen() {
+    // Initialize current values from RTC if available, otherwise use defaults
+    if (rtc.begin()) {
+        DateTime now = rtc.now();
+        // Convert 4-digit year to 2-digit for display (2024 -> 24)
+        current_year = now.year() % 100;
+        current_month = now.month();
+        current_day = now.day();
+        current_hour = now.hour();
+        current_minute = now.minute();
+        current_second = now.second();
+    }
+    
+    // Create a new screen for time entry
+    // Use lv_obj_create(NULL) to create a screen object
+    time_entry_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(time_entry_screen, LV_COLOR_MAKE(255, 255, 255), 0);
+    
+    Serial.print("[DEBUG] Created time_entry_screen, pointer: 0x");
+    Serial.println((uint32_t)time_entry_screen, HEX);
+    
+    // Create styles
+    lv_style_init(&label_style);
+    lv_style_set_text_color(&label_style, LV_COLOR_MAKE(0, 0, 0));
+    lv_style_set_text_font(&label_style, &lv_font_montserrat_14);
+    
+    lv_style_init(&value_style);
+    lv_style_set_text_color(&value_style, LV_COLOR_MAKE(0, 0, 0));
+    lv_style_set_text_font(&value_style, &lv_font_montserrat_24);
+    
+    // Header style for title (size 24)
+    lv_style_init(&header_style);
+    lv_style_set_text_color(&header_style, LV_COLOR_MAKE(0, 0, 0));
+    lv_style_set_text_font(&header_style, &lv_font_montserrat_24);
+    
+    // Title
+    lv_obj_t *title_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(title_label, "Set Current Time");
+    lv_obj_add_style(title_label, &header_style, 0);
+    lv_obj_set_pos(title_label, 20, 10);
+    
+    // Layout constants - optimized for 240px wide display
+    int start_y = 45;
+    int btn_size = 25;           // Smaller buttons to fit better
+    int value_width = 45;         // Width for value display
+    int spacing_x = 75;           // Horizontal spacing between columns (75px per column)
+    int spacing_y = 70;           // Vertical spacing between rows
+    int value_y_offset = 22;      // Vertical offset for value below label
+    int btn_x_offset = 5;        // Horizontal offset for buttons from value
+    
+    // Explicit button coordinates - manually set for precise touch alignment
+    // Based on Year UP working at touch (57, 80), button positioned at (56, 67)
+    // Adjust these values based on actual touch coordinates when testing each button
+    
+    int col1_x = 10;
+    int col2_x = 85;   // 10 + 75 spacing
+    int col3_x = 160;  // 10 + 150 spacing
+    
+    // Year field (Column 1, Row 1) - WORKING at x=56, y=67
+    lv_obj_t *year_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(year_field_label, "Year:");
+    lv_obj_add_style(year_field_label, &label_style, 0);
+    lv_obj_set_pos(year_field_label, col1_x, start_y);
+    
+    year_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(year_label, &value_style, 0);
+    lv_obj_set_pos(year_label, col1_x, start_y + value_y_offset);
+    
+    // Year buttons: Visual positions (buttons stay where they look good)
+    // Touch coordinates will be mapped manually in touch_read()
+    create_arrow_buttons(time_entry_screen, &year_up_btn, &year_down_btn, 
+                         col1_x + btn_x_offset, start_y + value_y_offset + btn_size, btn_size);
+    
+    // Month field (Column 2, Row 1) - NEEDS CALIBRATION
+    lv_obj_t *month_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(month_field_label, "Month:");
+    lv_obj_add_style(month_field_label, &label_style, 0);
+    lv_obj_set_pos(month_field_label, col2_x, start_y);
+    
+    month_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(month_label, &value_style, 0);
+    lv_obj_set_pos(month_label, col2_x, start_y + value_y_offset);
+    
+    // Month buttons: Back to original position
+    create_arrow_buttons(time_entry_screen, &month_up_btn, &month_down_btn, 
+                         131, 67, btn_size);
+    
+    // Day field (Column 3, Row 1) - NEEDS CALIBRATION
+    lv_obj_t *day_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(day_field_label, "Day:");
+    lv_obj_add_style(day_field_label, &label_style, 0);
+    lv_obj_set_pos(day_field_label, col3_x, start_y);
+    
+    day_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(day_label, &value_style, 0);
+    lv_obj_set_pos(day_label, col3_x, start_y + value_y_offset);
+    
+    // Day buttons: Back to original position
+    create_arrow_buttons(time_entry_screen, &day_up_btn, &day_down_btn, 
+                         206, 67, btn_size);
+    
+    // Hour field (Column 1, Row 2) - Moved down 20 pixels for better spacing
+    lv_obj_t *hour_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(hour_field_label, "Hour:");
+    lv_obj_add_style(hour_field_label, &label_style, 0);
+    lv_obj_set_pos(hour_field_label, col1_x, start_y + spacing_y + 20);
+    
+    hour_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(hour_label, &value_style, 0);
+    lv_obj_set_pos(hour_label, col1_x, start_y + spacing_y + 20 + value_y_offset);
+    
+    // Hour buttons: Moved down 20 pixels
+    create_arrow_buttons(time_entry_screen, &hour_up_btn, &hour_down_btn, 
+                         56, start_y + spacing_y + 20 + value_y_offset, btn_size);
+    
+    // Minute field (Column 2, Row 2) - Moved down 20 pixels for better spacing
+    lv_obj_t *minute_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(minute_field_label, "Minute:");
+    lv_obj_add_style(minute_field_label, &label_style, 0);
+    lv_obj_set_pos(minute_field_label, col2_x, start_y + spacing_y + 20);
+    
+    minute_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(minute_label, &value_style, 0);
+    lv_obj_set_pos(minute_label, col2_x, start_y + spacing_y + 20 + value_y_offset);
+    
+    // Minute buttons: Moved down 20 pixels
+    create_arrow_buttons(time_entry_screen, &minute_up_btn, &minute_down_btn, 
+                         131, start_y + spacing_y + 20 + value_y_offset, btn_size);
+    
+    // Second field (Column 3, Row 2) - Moved down 20 pixels for better spacing
+    lv_obj_t *second_field_label = lv_label_create(time_entry_screen);
+    lv_label_set_text(second_field_label, "Second:");
+    lv_obj_add_style(second_field_label, &label_style, 0);
+    lv_obj_set_pos(second_field_label, col3_x, start_y + spacing_y + 20);
+    
+    second_label = lv_label_create(time_entry_screen);
+    lv_obj_add_style(second_label, &value_style, 0);
+    lv_obj_set_pos(second_label, col3_x, start_y + spacing_y + 20 + value_y_offset);
+    
+    // Second buttons: Moved down 20 pixels
+    create_arrow_buttons(time_entry_screen, &second_up_btn, &second_down_btn, 
+                         206, start_y + spacing_y + 20 + value_y_offset, btn_size);
+    
+    // Set Time button (centered at bottom of screen with 5px buffer)
+    set_time_btn = lv_btn_create(time_entry_screen);
+    lv_obj_set_size(set_time_btn, 200, 40);
+    // Position at bottom: screen height (320) - button height (40) - buffer (5) = 275
+    lv_obj_set_pos(set_time_btn, 20, DISPLAY_HEIGHT - 40 - 5);
+    lv_obj_add_event_cb(set_time_btn, time_entry_btn_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *btn_label = lv_label_create(set_time_btn);
+    lv_label_set_text(btn_label, "Set Time");
+    lv_obj_center(btn_label);
+    
+    // Initialize display
+    update_time_entry_display();
+}
+
+// Arrow button event handler for adjusting time values
+static void arrow_btn_event_handler(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *btn = lv_event_get_target(e);
+    
+    Serial.print("[DEBUG] Arrow button event - Code: ");
+    Serial.print(code);
+    Serial.print(" (CLICKED=");
+    Serial.print(LV_EVENT_CLICKED);
+    Serial.print(", PRESSED=");
+    Serial.print(LV_EVENT_PRESSED);
+    Serial.print(", RELEASED=");
+    Serial.print(LV_EVENT_RELEASED);
+    Serial.print("), Button pointer: 0x");
+    Serial.println((uint32_t)btn, HEX);
+    
+    if(code == LV_EVENT_CLICKED) {
+        Serial.println("[DEBUG] LV_EVENT_CLICKED detected!");
+        
+        bool increment = false;
+        int *target_value = NULL;
+        int min_val = 0, max_val = 0;
+        const char *field_name = "UNKNOWN";
+        
+        // Determine which button was pressed and set limits
+        Serial.print("[DEBUG] Comparing button pointer 0x");
+        Serial.print((uint32_t)btn, HEX);
+        Serial.print(" with Year UP: 0x");
+        Serial.print((uint32_t)year_up_btn, HEX);
+        Serial.print(", Year DOWN: 0x");
+        Serial.println((uint32_t)year_down_btn, HEX);
+        
+        if (btn == year_up_btn) {
+            increment = true;
+            target_value = &current_year;
+            min_val = 0;   // Display as 2-digit (00-99)
+            max_val = 99;  // Display as 2-digit (00-99)
+            field_name = "YEAR";
+            Serial.println("[DEBUG] Year UP button pressed - MATCHED!");
+        } else if (btn == year_down_btn) {
+            increment = false;
+            target_value = &current_year;
+            min_val = 0;   // Display as 2-digit (00-99)
+            max_val = 99;  // Display as 2-digit (00-99)
+            field_name = "YEAR";
+            Serial.println("[DEBUG] Year DOWN button pressed - MATCHED!");
+        } else if (btn == month_up_btn) {
+            increment = true;
+            target_value = &current_month;
+            min_val = 1;
+            max_val = 12;
+            field_name = "MONTH";
+            Serial.println("[DEBUG] Month UP button pressed");
+        } else if (btn == month_down_btn) {
+            increment = false;
+            target_value = &current_month;
+            min_val = 1;
+            max_val = 12;
+            field_name = "MONTH";
+            Serial.println("[DEBUG] Month DOWN button pressed");
+        } else if (btn == day_up_btn) {
+            increment = true;
+            target_value = &current_day;
+            min_val = 1;
+            max_val = 31;  // Will validate against actual month later
+            field_name = "DAY";
+            Serial.println("[DEBUG] Day UP button pressed");
+        } else if (btn == day_down_btn) {
+            increment = false;
+            target_value = &current_day;
+            min_val = 1;
+            max_val = 31;
+            field_name = "DAY";
+            Serial.println("[DEBUG] Day DOWN button pressed");
+        } else if (btn == hour_up_btn) {
+            increment = true;
+            target_value = &current_hour;
+            min_val = 0;
+            max_val = 23;
+            field_name = "HOUR";
+            Serial.println("[DEBUG] Hour UP button pressed");
+        } else if (btn == hour_down_btn) {
+            increment = false;
+            target_value = &current_hour;
+            min_val = 0;
+            max_val = 23;
+            field_name = "HOUR";
+            Serial.println("[DEBUG] Hour DOWN button pressed");
+        } else if (btn == minute_up_btn) {
+            increment = true;
+            target_value = &current_minute;
+            min_val = 0;
+            max_val = 59;
+            field_name = "MINUTE";
+            Serial.println("[DEBUG] Minute UP button pressed");
+        } else if (btn == minute_down_btn) {
+            increment = false;
+            target_value = &current_minute;
+            min_val = 0;
+            max_val = 59;
+            field_name = "MINUTE";
+            Serial.println("[DEBUG] Minute DOWN button pressed");
+        } else if (btn == second_up_btn) {
+            increment = true;
+            target_value = &current_second;
+            min_val = 0;
+            max_val = 59;
+            field_name = "SECOND";
+            Serial.println("[DEBUG] Second UP button pressed");
+        } else if (btn == second_down_btn) {
+            increment = false;
+            target_value = &current_second;
+            min_val = 0;
+            max_val = 59;
+            field_name = "SECOND";
+            Serial.println("[DEBUG] Second DOWN button pressed");
+        } else {
+            Serial.print("[DEBUG] WARNING: Unknown button pressed! Button pointer: 0x");
+            Serial.println((uint32_t)btn, HEX);
+            Serial.println("[DEBUG] Known button pointers:");
+            Serial.print("  Year UP: 0x");
+            Serial.print((uint32_t)year_up_btn, HEX);
+            Serial.print(", Year DOWN: 0x");
+            Serial.println((uint32_t)year_down_btn, HEX);
+            Serial.print("  Month UP: 0x");
+            Serial.print((uint32_t)month_up_btn, HEX);
+            Serial.print(", Month DOWN: 0x");
+            Serial.println((uint32_t)month_down_btn, HEX);
+            Serial.print("  Day UP: 0x");
+            Serial.print((uint32_t)day_up_btn, HEX);
+            Serial.print(", Day DOWN: 0x");
+            Serial.println((uint32_t)day_down_btn, HEX);
+        }
+        
+        // Update the value
+        if (target_value != NULL) {
+            int old_value = *target_value;
+            
+            if (increment) {
+                (*target_value)++;
+                if (*target_value > max_val) {
+                    *target_value = min_val;  // Wrap around
+                }
+            } else {
+                (*target_value)--;
+                if (*target_value < min_val) {
+                    *target_value = max_val;  // Wrap around
+                }
+            }
+            
+            Serial.print("[DEBUG] ");
+            Serial.print(field_name);
+            Serial.print(" changed: ");
+            Serial.print(old_value);
+            Serial.print(" -> ");
+            Serial.println(*target_value);
+            
+            // Validate day against month (simplified - doesn't account for leap years)
+            if (target_value == &current_day) {
+                int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                int max_day = days_in_month[current_month - 1];
+                if (current_day > max_day) {
+                    Serial.print("[DEBUG] Day adjusted for month - was ");
+                    Serial.print(current_day);
+                    Serial.print(", now ");
+                    current_day = max_day;
+                    Serial.println(current_day);
+                }
+                if (current_day < 1) {
+                    current_day = 1;
+                }
+            }
+            
+            // Update display
+            Serial.println("[DEBUG] Calling update_time_entry_display()");
+            update_time_entry_display();
+        } else {
+            Serial.println("[DEBUG] ERROR: target_value is NULL!");
+        }
+    } else {
+        Serial.print("[DEBUG] Event code is not CLICKED: ");
+        Serial.println(code);
+    }
+}
+
+// Button event handler for Set Time button
+static void time_entry_btn_event_handler(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    Serial.print("[DEBUG] Set Time button event - Code: ");
+    Serial.println(code);
+    
+    if(code == LV_EVENT_CLICKED) {
+        Serial.println("[DEBUG] Set Time button CLICKED!");
+        
+        // Use stored values
+        // Convert 2-digit year to 4-digit (prepend "20")
+        int year_2digit = current_year;
+        int year_4digit = 2000 + year_2digit;  // Convert 24 -> 2024
+        int month = current_month;
+        int day = current_day;
+        int hour = current_hour;
+        int minute = current_minute;
+        int second = current_second;
+        
+        Serial.print("[DEBUG] Attempting to set time: ");
+        Serial.print(year_2digit);
+        Serial.print(" (");
+        Serial.print(year_4digit);
+        Serial.print(") / ");
+        Serial.print(month);
+        Serial.print("/");
+        Serial.print(day);
+        Serial.print(" ");
+        Serial.print(hour);
+        Serial.print(":");
+        Serial.print(minute);
+        Serial.print(":");
+        Serial.println(second);
+        
+        // Validate and set time
+        // Year validation: 2-digit year should be 0-99 (becomes 2000-2099)
+        if (year_2digit >= 0 && year_2digit <= 99 &&
+            month >= 1 && month <= 12 &&
+            day >= 1 && day <= 31 &&
+            hour >= 0 && hour <= 23 &&
+            minute >= 0 && minute <= 59 &&
+            second >= 0 && second <= 59) {
+            
+            Serial.println("[DEBUG] Basic validation passed");
+            
+            // Additional day validation
+            int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            int max_day = days_in_month[month - 1];
+            if (day > max_day) {
+                Serial.print("[DEBUG] Day adjusted for month - was ");
+                Serial.print(day);
+                Serial.print(", now ");
+                day = max_day;
+                Serial.println(day);
+            }
+            
+            Serial.print("[DEBUG] Calling setRTCTime() with 4-digit year: ");
+            Serial.println(year_4digit);
+            setRTCTime(year_4digit, month, day, hour, minute, second);
+            
+            Serial.println("[DEBUG] Calling show_monitoring_screen()");
+            // Switch to monitoring screen
+            show_monitoring_screen();
+        } else {
+            Serial.println("[DEBUG] ERROR: Invalid time values!");
+            Serial.print("[DEBUG] Validation failed - Year (2-digit): ");
+            Serial.print(year_2digit >= 0 && year_2digit <= 99);
+            Serial.print(", Month: ");
+            Serial.print(month >= 1 && month <= 12);
+            Serial.print(", Day: ");
+            Serial.print(day >= 1 && day <= 31);
+            Serial.print(", Hour: ");
+            Serial.print(hour >= 0 && hour <= 23);
+            Serial.print(", Minute: ");
+            Serial.print(minute >= 0 && minute <= 59);
+            Serial.print(", Second: ");
+            Serial.println(second >= 0 && second <= 59);
+        }
+    } else {
+        Serial.print("[DEBUG] Set Time button event code is not CLICKED: ");
+        Serial.println(code);
+    }
+}
+
+// Show monitoring screen
+void show_monitoring_screen() {
+    // Switch to default screen (monitoring screen)
+    lv_scr_load(lv_scr_act());
+    rtc_time_set = true;  // Ensure flag is set
+    lv_refr_now(NULL);  // Force refresh
+    Serial.println("Switched to monitoring screen");
 }
 
 // Read sensor data from UART slave (half-duplex: slave sends periodically)
@@ -425,14 +1094,49 @@ void updateTimeDisplay() {
     lv_label_set_text(time_label, datetime_str);
 }
 
-// Set RTC time (called from Serial commands)
+// Check if RTC time is set (not at default value)
+// DS3231 defaults to 2000-01-01 00:00:00 when first powered or after losing power
+bool isRTCTimeSet() {
+    if (!rtc.begin()) {
+        return false;  // RTC not available
+    }
+    
+    DateTime now = rtc.now();
+    // Check if time is at default (2000-01-01 00:00:00)
+    if (now.year() == 2000 && now.month() == 1 && now.day() == 1 && 
+        now.hour() == 0 && now.minute() == 0 && now.second() == 0) {
+        return false;  // Time is at default, not set
+    }
+    
+    // Also check if year is reasonable (not before 2020)
+    if (now.year() < 2020) {
+        return false;  // Time seems invalid
+    }
+    
+    return true;  // Time appears to be set
+}
+
+// Set RTC time (called from Serial commands or UI)
 void setRTCTime(int year, int month, int day, int hour, int minute, int second) {
     if (!rtc.begin()) {
         Serial.println("ERROR: RTC not initialized!");
         return;
     }
     
+    // Validate inputs
+    if (year < 2020 || year > 2099 ||
+        month < 1 || month > 12 ||
+        day < 1 || day > 31 ||
+        hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59 ||
+        second < 0 || second > 59) {
+        Serial.println("ERROR: Invalid time values!");
+        return;
+    }
+    
     rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    rtc_time_set = true;  // Mark time as set
+    
     Serial.print("RTC time set to: ");
     Serial.print(year);
     Serial.print("/");
@@ -463,11 +1167,7 @@ void checkSerialCommands() {
                 Serial.println("ERROR: Invalid SETTIME format. Use: SETTIME YYYY MM DD HH MM SS");
             }
         }
-        // Command: SETTIME_NOW - sets RTC to compile time
-        else if (command == "SETTIME_NOW") {
-            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-            Serial.println("RTC set to compile time");
-        }
+        // Note: SETTIME_NOW removed - user must set time via UI or SETTIME command
         // Command: SHOWTIME - displays current RTC time
         else if (command == "SHOWTIME") {
             if (rtc.begin()) {
@@ -539,14 +1239,20 @@ void setup() {
     if (!rtc.begin()) {
         Serial.println("ERROR: Couldn't find RTC!");
         Serial.println("RTC will not be available");
+        rtc_time_set = false;
     } else {
         Serial.println("DS3231 RTC initialized successfully");
         
-        // Check if RTC lost power and set to compile time if needed
-        if (rtc.lostPower()) {
-            Serial.println("RTC lost power - setting to compile time");
-            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-        }
+        // COMMENTED OUT: Check if RTC time is set - now setting at compile time instead
+        // Check if RTC time is set (not at default)
+        // rtc_time_set = isRTCTimeSet();
+        
+        // Set RTC time at compile time
+        // TODO: Update these values when compiling for the correct time
+        // Format: setRTCTime(year, month, day, hour, minute, second)
+        setRTCTime(2024, 12, 15, 12, 0, 0);  // Set compile-time date/time here
+        rtc_time_set = true;  // Mark time as set after compile-time initialization
+        Serial.println("RTC time set to compile-time value");
         
         // Display current RTC time
         DateTime now = rtc.now();
@@ -563,10 +1269,16 @@ void setup() {
         Serial.print(":");
         Serial.println(now.second());
         
-        Serial.println("\nTo set RTC time via Serial:");
-        Serial.println("  SETTIME YYYY MM DD HH MM SS");
-        Serial.println("  SETTIME_NOW (sets to compile time)");
-        Serial.println("  SHOWTIME (displays current time)");
+        // COMMENTED OUT: Time setting via UI/Serial disabled - using compile-time time
+        // if (rtc_time_set) {
+        //     Serial.println("RTC time is set and valid");
+        // } else {
+        //     Serial.println("RTC time is NOT set (at default) - user must set time");
+        // }
+        // 
+        // Serial.println("\nTo set RTC time via Serial:");
+        // Serial.println("  SETTIME YYYY MM DD HH MM SS");
+        // Serial.println("  SHOWTIME (displays current time)");
     }
     
     // Initialize SD card on HSPI bus
@@ -621,8 +1333,28 @@ void setup() {
     
     // LV_TICK_CUSTOM is enabled, so LVGL uses millis() directly - no timer needed
     
-    // Create monitoring screen
+    // Create monitoring screen (default screen)
     create_monitoring_screen();
+    
+    // Create time entry screen
+    // COMMENTED OUT: Time setting screen disabled - using compile-time time instead
+    // create_time_entry_screen();
+    
+    // Show appropriate screen based on RTC time status
+    // COMMENTED OUT: Always show monitoring screen - time set at compile time
+    // if (!rtc_time_set) {
+    //     // Time not set - show time entry screen
+    //     lv_scr_load(time_entry_screen);
+    //     Serial.println("Showing time entry screen - time must be set");
+    // } else {
+    //     // Time is set - show monitoring screen
+    //     lv_scr_load(lv_scr_act());
+    //     Serial.println("Showing monitoring screen");
+    // }
+    
+    // Always show monitoring screen (time set at compile time)
+    lv_scr_load(lv_scr_act());
+    Serial.println("Showing monitoring screen");
     
     // Force a refresh to ensure the screen is displayed
     lv_refr_now(NULL);
@@ -638,16 +1370,20 @@ void loop() {
     // Check for Serial commands (time setting, etc.)
     checkSerialCommands();
     
-    // Update time display every second
-    static unsigned long last_time_update = 0;
-    if (millis() - last_time_update >= 1000) {
-        updateTimeDisplay();
-        last_time_update = millis();
-    }
-    
-    // Check for incoming sensor data from slave (UART hardware detects when data arrives)
-    SensorData sensor_data;
-    if (readSensorData(&sensor_data)) {
+    // COMMENTED OUT: Always process sensor data (time set at compile time)
+    // Only process sensor data if time is set
+    // if (rtc_time_set) {
+    {
+        // Update time display every second
+        static unsigned long last_time_update = 0;
+        if (millis() - last_time_update >= 1000) {
+            updateTimeDisplay();
+            last_time_update = millis();
+        }
+        
+        // Check for incoming sensor data from slave (UART hardware detects when data arrives)
+        SensorData sensor_data;
+        if (readSensorData(&sensor_data)) {
             unsigned long current_time = millis();
             // Check for alarm conditions
             bool alarm = checkAlarmConditions(sensor_data);
@@ -697,9 +1433,13 @@ void loop() {
             Serial.print("g, Current: ");
             Serial.print(sensor_data.current_draw);
             Serial.println("A");
-        } else {
-            Serial.println("Failed to receive valid sensor data");
-            // Display error or keep previous values
         }
+        // If no valid data, just keep previous values displayed
         delay(5);
+    // COMMENTED OUT: Time entry screen handling disabled
+    // } else {
+    //     // Time not set - stay on time entry screen
+    //     // User interaction handled by LVGL touch events
+    // }
     }
+}

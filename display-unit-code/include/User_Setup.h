@@ -41,7 +41,7 @@
 #define SPI_TOUCH_FREQUENCY  2500000
 
 // Display orientation
-#define TFT_ROTATION 1  // 0=Portrait, 1=Landscape, 2=Portrait inverted, 3=Landscape inverted
+#define TFT_ROTATION 0  // 0=Portrait, 1=Landscape, 2=Portrait inverted, 3=Landscape inverted
 
 // Color order (most displays use RGB)
 #define TFT_RGB_ORDER TFT_BGR  // TFT_RGB or TFT_BGR - switched to BGR because green/blue were swapped
