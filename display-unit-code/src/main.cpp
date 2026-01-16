@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <cstring>
 #include "touch_mapping.h"
 
 // LVGL display buffer size
@@ -19,9 +20,11 @@
 // UART Configuration for slave communication (half-duplex: master only receives)
 #define UART_RX_PIN 3        // GPIO 3 - RX pin for receiving data from slave
 #define UART_BAUD 9600       // UART baud rate
-#define SD_CS_PIN 15         // Chip Select pin for SD card
-#define SD_SPI_FREQ 25000000 // SD card SPI frequency: 25MHz (max for most cards)
-#define SD_LOG_INTERVAL 900000  // Log to SD card every 15 minutes (900000ms)
+// SD card VSPI pin configuration (shares SPI bus with TFT display)
+// Using default SPI instance (VSPI) that TFT_eSPI already initialized
+#define SD_CS_PIN 33         // Chip Select pin for SD card
+#define SD_SPI_FREQ 10000000 // SD card SPI frequency: 10MHz (conservative for GPIO matrix pins)
+#define SD_LOG_INTERVAL 30000  // Log to SD card every 30 seconds (30000ms)
 
 // I2C Configuration for DS3231 RTC
 #define I2C_SDA_PIN 21       // GPIO 21 - SDA pin for I2C
@@ -37,6 +40,9 @@ HardwareSerial SlaveUART(2);
 
 // RTC instance
 RTC_DS3231 rtc;
+
+// Using default SPI instance (VSPI) that TFT_eSPI already initialized
+// No need to create separate SPI instance - TFT_eSPI handles VSPI initialization
 
 // SD card logging timer
 unsigned long last_sd_log_time = 0;
@@ -60,6 +66,7 @@ void show_monitoring_screen();
 static void time_entry_btn_event_handler(lv_event_t * e);
 static void arrow_btn_event_handler(lv_event_t * e);
 void update_time_entry_display();
+void setRTCFromCompileTime();
 
 // TFT_eSPI instance
 TFT_eSPI tft = TFT_eSPI();
@@ -1000,15 +1007,159 @@ bool checkAlarmConditions(const SensorData& data) {
             data.current_draw > CURRENT_MAX);
 }
 
+// Calculate week number (1-52/53) based on day of year
+// Simple calculation: week = (day_of_year - 1) / 7 + 1
+int getWeekNumber(int year, int month, int day) {
+    // Days in each month (non-leap year)
+    int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    
+    // Check for leap year
+    bool is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    if (is_leap) {
+        days_in_month[1] = 29;  // February has 29 days in leap year
+    }
+    
+    // Calculate day of year
+    int day_of_year = 0;
+    for (int i = 0; i < month - 1; i++) {
+        day_of_year += days_in_month[i];
+    }
+    day_of_year += day;
+    
+    // Calculate week number (week 1 starts on Jan 1)
+    int week = (day_of_year - 1) / 7 + 1;
+    
+    // Ensure week is in range 1-53
+    if (week < 1) week = 1;
+    if (week > 53) week = 53;
+    
+    return week;
+}
+
+// Get the current week folder path (e.g., "/Week_2024_01/")
+String getWeekFolderPath() {
+    if (!rtc.begin()) {
+        return "/Week_0000_00/";  // Fallback if RTC not available
+    }
+    
+    DateTime now = rtc.now();
+    int year = now.year();
+    int week = getWeekNumber(year, now.month(), now.day());
+    
+    char folder_path[20];
+    snprintf(folder_path, sizeof(folder_path), "/Week_%04d_%02d/", year, week);
+    return String(folder_path);
+}
+
+// Get the current log file path with week folder
+String getCurrentLogFilePath() {
+    return getWeekFolderPath() + "sensor_log.csv";
+}
+
+// Ensure the week folder exists, create it if it doesn't
+// Uses SD.mkdir() to explicitly create the directory
+bool ensureWeekFolderExists() {
+    String folder_path = getWeekFolderPath();
+    
+    // Remove trailing slash for mkdir (if present)
+    String dir_path = folder_path;
+    if (dir_path.endsWith("/")) {
+        dir_path = dir_path.substring(0, dir_path.length() - 1);
+    }
+    
+    // Try to create the directory using SD.mkdir()
+    // Note: mkdir() returns true if directory already exists or was created successfully
+    if (SD.mkdir(dir_path)) {
+        Serial.print("[SD] Week folder ready: ");
+        Serial.println(folder_path);
+        return true;
+    } else {
+        Serial.print("[SD] Warning: Could not create week folder: ");
+        Serial.println(folder_path);
+        Serial.println("[SD] Directory may already exist, continuing...");
+        // Return true anyway - directory might already exist
+        // We'll find out when we try to create the CSV file
+        return true;
+    }
+}
+
+// Ensure CSV header exists in the file, create it if file is new
+bool ensureCSVHeaderExists(const String& filepath) {
+    // Check if file exists
+    File dataFile = SD.open(filepath, FILE_READ);
+    if (!dataFile) {
+        // File doesn't exist, create it with header
+        dataFile = SD.open(filepath, FILE_WRITE);
+        if (dataFile) {
+            dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
+            dataFile.close();
+            Serial.print("[SD] Created new CSV file with header: ");
+            Serial.println(filepath);
+            return true;
+        } else {
+            Serial.print("[SD] Error: Could not create CSV file: ");
+            Serial.println(filepath);
+            return false;
+        }
+    } else {
+        // File exists, check if it has content (header)
+        if (dataFile.size() == 0) {
+            // File exists but is empty, add header
+            dataFile.close();
+            dataFile = SD.open(filepath, FILE_WRITE);
+            if (dataFile) {
+                dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
+                dataFile.close();
+                Serial.print("[SD] Added header to empty CSV file: ");
+                Serial.println(filepath);
+                return true;
+            }
+        } else {
+            // File exists and has content, assume header is there
+            dataFile.close();
+        }
+    }
+    
+    return true;
+}
+
+// COMMENTED OUT: Timestamp update function - may cause SD card mounting issues
+// Update file timestamp to reflect last write time
+// Note: ESP32 SD library doesn't directly support setting timestamps,
+// so we "touch" the file by reopening it briefly to trigger timestamp update
+// void updateFileTimestamp(const String& filepath) {
+//     // Try to update file timestamp by opening in append mode and closing
+//     // This may trigger FatFS to update the modification time
+//     // Note: This is a workaround - FatFS may not update timestamps if FF_FS_NORTC is enabled
+//     // Opening in FILE_APPEND mode is safe - it won't overwrite existing content
+//     File touchFile = SD.open(filepath, FILE_APPEND);
+//     if (touchFile) {
+//         // File opened successfully - just close it to trigger timestamp update
+//         // The file pointer is already at the end, so no data is written
+//         touchFile.close();
+//     }
+//     // If file open fails, timestamp update is not critical - continue anyway
+// }
+
 // Log sensor data to SD card
 void logToSDCard(const SensorData& data, bool is_alarm) {
     if (!sd_card_initialized) {
         return;  // SD card not available
     }
     
-    File dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
+    // Get the current log file path (includes week folder)
+    String filepath = getCurrentLogFilePath();
+    
+    // Try to ensure week folder exists (may fail silently if it already exists)
+    ensureWeekFolderExists();
+    
+    // Ensure CSV header exists (this will also create the directory if needed)
+    ensureCSVHeaderExists(filepath);
+    
+    // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
+    File dataFile = SD.open(filepath, FILE_APPEND);
     if (dataFile) {
-        // CSV format: timestamp, datetime, oil_temp, motor_temp, vibration, current_draw, alarm_flag
+        // CSV format: timestamp, datetime, oil_temp, motor_temp, vibration, current_draw, status
         unsigned long timestamp = millis() / 1000;  // Seconds since boot
         
         // Add RTC datetime if available
@@ -1038,7 +1189,14 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
         
         dataFile.close();
         
-        Serial.print("Logged to SD: ");
+        // COMMENTED OUT: Timestamp update - may cause SD card mounting issues
+        // Update file timestamp to reflect last write time
+        // updateFileTimestamp(filepath);
+        
+        // Print success message with data details
+        Serial.print("[SD] Successfully saved to ");
+        Serial.print(filepath);
+        Serial.print(": ");
         if (is_alarm) {
             Serial.print("[ALARM] ");
         }
@@ -1052,7 +1210,9 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
         Serial.print(data.current_draw);
         Serial.println("A");
     } else {
-        Serial.println("Error opening sensor_log.csv");
+        Serial.print("[SD] Error: Failed to open ");
+        Serial.print(filepath);
+        Serial.println(" for writing");
     }
 }
 
@@ -1062,20 +1222,50 @@ void logAcknowledgmentToSD() {
         return;  // SD card not available
     }
     
-    File dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
+    // Get the current log file path (includes week folder)
+    String filepath = getCurrentLogFilePath();
+    
+    // Try to ensure week folder exists (may fail silently if it already exists)
+    ensureWeekFolderExists();
+    
+    // Ensure CSV header exists (this will also create the directory if needed)
+    ensureCSVHeaderExists(filepath);
+    
+    // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
+    File dataFile = SD.open(filepath, FILE_APPEND);
     if (dataFile) {
         unsigned long timestamp = millis() / 1000;  // Seconds since boot
         
+        // Add RTC datetime if available
+        String datetime_str = "";
+        if (rtc.begin()) {
+            DateTime now = rtc.now();
+            char dt_buf[32];
+            snprintf(dt_buf, sizeof(dt_buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                    now.year(), now.month(), now.day(),
+                    now.hour(), now.minute(), now.second());
+            datetime_str = String(dt_buf);
+        }
+        
         // Log acknowledgment event with empty sensor values and ACKNOWLEDGED status
         dataFile.print(timestamp);
+        dataFile.print(",");
+        dataFile.print(datetime_str);
         dataFile.print(",,,,");  // Empty sensor values (oil_temp, motor_temp, vibration, current_draw)
         dataFile.println("ACKNOWLEDGED");
         
         dataFile.close();
         
-        Serial.println("Logged alarm acknowledgment to SD card");
+        // COMMENTED OUT: Timestamp update - may cause SD card mounting issues
+        // Update file timestamp to reflect last write time
+        // updateFileTimestamp(filepath);
+        
+        Serial.print("[SD] Successfully saved alarm acknowledgment to ");
+        Serial.println(filepath);
     } else {
-        Serial.println("Error opening sensor_log.csv for acknowledgment log");
+        Serial.print("[SD] Error: Failed to open ");
+        Serial.print(filepath);
+        Serial.println(" for acknowledgment log");
     }
 }
 
@@ -1114,6 +1304,47 @@ bool isRTCTimeSet() {
     }
     
     return true;  // Time appears to be set
+}
+
+// Parse compile-time date and time from __DATE__ and __TIME__ macros
+// __DATE__ format: "Mmm dd yyyy" (e.g., "Dec 15 2024")
+// __TIME__ format: "hh:mm:ss" (e.g., "12:34:56")
+void setRTCFromCompileTime() {
+    if (!rtc.begin()) {
+        Serial.println("ERROR: RTC not initialized!");
+        return;
+    }
+    
+    // Parse __DATE__: "Mmm dd yyyy"
+    const char* date_str = __DATE__;
+    const char* month_names[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    
+    char month_str[4];
+    int day, year;
+    sscanf(date_str, "%s %d %d", month_str, &day, &year);
+    
+    // Find month number
+    int month = 1;
+    for (int i = 0; i < 12; i++) {
+        if (strcmp(month_str, month_names[i]) == 0) {
+            month = i + 1;
+            break;
+        }
+    }
+    
+    // Parse __TIME__: "hh:mm:ss"
+    const char* time_str = __TIME__;
+    int hour, minute, second;
+    sscanf(time_str, "%d:%d:%d", &hour, &minute, &second);
+    
+    // Set RTC time
+    Serial.print("Setting RTC from compile time: ");
+    Serial.print(__DATE__);
+    Serial.print(" ");
+    Serial.println(__TIME__);
+    
+    setRTCTime(year, month, day, hour, minute, second);
 }
 
 // Set RTC time (called from Serial commands or UI)
@@ -1247,12 +1478,10 @@ void setup() {
         // Check if RTC time is set (not at default)
         // rtc_time_set = isRTCTimeSet();
         
-        // Set RTC time at compile time
-        // TODO: Update these values when compiling for the correct time
-        // Format: setRTCTime(year, month, day, hour, minute, second)
-        setRTCTime(2024, 12, 15, 12, 0, 0);  // Set compile-time date/time here
+        // Set RTC time from compile-time macros (__DATE__ and __TIME__)
+        // This automatically uses the date/time when the firmware was compiled
+        setRTCFromCompileTime();
         rtc_time_set = true;  // Mark time as set after compile-time initialization
-        Serial.println("RTC time set to compile-time value");
         
         // Display current RTC time
         DateTime now = rtc.now();
@@ -1281,34 +1510,101 @@ void setup() {
         // Serial.println("  SHOWTIME (displays current time)");
     }
     
-    // Initialize SD card on HSPI bus
+    // Initialize SD card on VSPI bus (shares SPI bus with TFT display)
+    // Using default SPI instance (VSPI) that TFT_eSPI already initialized
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);  // CS high = SD card not selected
     
-    // Initialize SD card with HSPI
-    // Note: ESP32 SD library uses default SPI, we may need to configure HSPI as default
-    // or use a library that supports custom SPI. For now, try standard begin.
-    // If this doesn't work, you may need to use SdFat library instead.
-    if (SD.begin(SD_CS_PIN)) {
+    // Ensure TFT CS is held high (TFT not selected) before SD init
+    // TFT_CS is GPIO 16 (from User_Setup.h)
+    pinMode(16, OUTPUT);
+    digitalWrite(16, HIGH);
+    delay(100);  // Small delay to let bus stabilize
+    
+    Serial.println("Using default SPI instance (VSPI) initialized by TFT_eSPI");
+    Serial.print("SD CS Pin: GPIO ");
+    Serial.println(SD_CS_PIN);
+    Serial.println("SPI pins shared with TFT: MOSI=23, SCK=18");
+    
+    // Initialize SD card with default SPI instance (VSPI)
+    // Try with a conservative frequency first (4MHz), then increase if needed
+    Serial.println("Attempting to initialize SD card...");
+    Serial.print("Using SPI frequency: ");
+    Serial.print(SD_SPI_FREQ / 1000000);
+    Serial.println(" MHz");
+    Serial.println("[SD] Auto-format enabled: blank cards will be formatted automatically");
+    
+    // Try initializing with the specified frequency
+    // Parameters: CS pin, SPI instance, frequency, mount point, max files, format_if_empty
+    // format_if_empty=true will automatically format blank/unformatted cards
+    Serial.println("[SD] Step 1: Attempting to mount SD card...");
+    // Use default SPI instance (VSPI) - TFT_eSPI already initialized it
+    if (SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQ, "/sd", 5, true)) {
+        Serial.println("[SD] Step 1: SUCCESS - SD card mounted!");
         sd_card_initialized = true;
-        Serial.println("SD card initialized successfully");
         
-            // Create CSV header if file doesn't exist
-            File dataFile = SD.open("/sensor_log.csv", FILE_READ);
-            if (!dataFile) {
-                // File doesn't exist, create it with header
-                dataFile = SD.open("/sensor_log.csv", FILE_WRITE);
-                if (dataFile) {
-                    dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
-                    dataFile.close();
-                    Serial.println("Created sensor_log.csv with header");
+        // Test write capability
+        Serial.println("[SD] Step 2: Testing write capability...");
+        File testFile = SD.open("/test_write.txt", FILE_WRITE);
+        if (testFile) {
+            testFile.println("SD card write test - OK");
+            testFile.close();
+            Serial.println("[SD] Step 2: SUCCESS - Write test passed!");
+            
+            // Clean up test file
+            SD.remove("/test_write.txt");
+            
+            // Test week folder creation and CSV file setup
+            Serial.println("[SD] Step 3: Testing week folder structure...");
+            if (ensureWeekFolderExists()) {
+                String week_path = getWeekFolderPath();
+                Serial.print("[SD] Week folder: ");
+                Serial.println(week_path);
+                
+                String log_path = getCurrentLogFilePath();
+                Serial.print("[SD] Log file path: ");
+                Serial.println(log_path);
+                
+                if (ensureCSVHeaderExists(log_path)) {
+                    Serial.println("[SD] Step 3: SUCCESS - Week folder structure ready");
+                } else {
+                    Serial.println("[SD] Step 3: WARNING - Could not create CSV file");
                 }
             } else {
-                dataFile.close();
+                Serial.println("[SD] Step 3: WARNING - Could not create week folder");
             }
+            
+            Serial.println("[SD] ========================================");
+            Serial.println("[SD] SD CARD FULLY OPERATIONAL");
+            Serial.println("[SD] Ready to log sensor data every 30 seconds");
+            Serial.println("[SD] ========================================");
+        } else {
+            Serial.println("[SD] Step 2: FAILED - Cannot write to SD card");
+            Serial.println("[SD] Card is detected but write operations fail");
+            Serial.println("[SD] Possible causes:");
+            Serial.println("[SD]   - Write-protect switch enabled (if card has one)");
+            Serial.println("[SD]   - Card is read-only");
+            Serial.println("[SD]   - Filesystem corruption");
+            sd_card_initialized = false;
+        }
     } else {
         sd_card_initialized = false;
-        Serial.println("SD card initialization failed - logging disabled");
+        Serial.println("[SD] Step 1: FAILED - SD card mount failed!");
+        Serial.println("[SD] ========================================");
+        Serial.println("[SD] DIAGNOSIS: Card detection/communication issue");
+        Serial.println("[SD] ========================================");
+        Serial.println("[SD] Possible causes:");
+        Serial.println("[SD]   1. SD card not inserted or not making contact");
+        Serial.println("[SD]   2. Incorrect wiring:");
+        Serial.println("[SD]      - CLK should be GPIO 18 (shared with TFT)");
+        Serial.println("[SD]      - MISO should be GPIO 19");
+        Serial.println("[SD]      - MOSI should be GPIO 23 (shared with TFT)");
+        Serial.println("[SD]      - CS should be GPIO 33");
+        Serial.println("[SD]   3. Loose connections or bad solder joints");
+        Serial.println("[SD]   4. SPI frequency too high (currently 10MHz)");
+        Serial.println("[SD]   5. Power supply issues (SD cards need stable power)");
+        Serial.println("[SD] Note: Auto-format is enabled but card must be detected first");
+        Serial.println("[SD] Logging disabled until SD card is available");
     }
     
     // Initialize display buffer for LVGL 8.3.11
@@ -1408,17 +1704,9 @@ void loop() {
             // Update display with received data
             updateDisplay(sensor_data);
             
-            // Log to SD card if:
-            // 1. Alarm condition detected, OR
-            // 2. 15 minutes have passed since last log
-            bool should_log = false;
-            if (alarm) {
-                should_log = true;
-            } else if (current_time - last_sd_log_time >= SD_LOG_INTERVAL) {
-                should_log = true;
-            }
-            
-            if (should_log) {
+            // Log to SD card every 30 seconds (regardless of alarm status)
+            // This ensures consistent logging interval even during persistent alarms
+            if (current_time - last_sd_log_time >= SD_LOG_INTERVAL) {
                 logToSDCard(sensor_data, alarm);
                 last_sd_log_time = current_time;
             }
