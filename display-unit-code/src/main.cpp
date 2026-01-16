@@ -1167,23 +1167,31 @@ bool ensureCSVHeaderExists(const String& filepath) {
     return true;
 }
 
-// COMMENTED OUT: Timestamp update function - may cause SD card mounting issues
 // Update file timestamp to reflect last write time
 // Note: ESP32 SD library doesn't directly support setting timestamps,
 // so we "touch" the file by reopening it briefly to trigger timestamp update
-// void updateFileTimestamp(const String& filepath) {
-//     // Try to update file timestamp by opening in append mode and closing
-//     // This may trigger FatFS to update the modification time
-//     // Note: This is a workaround - FatFS may not update timestamps if FF_FS_NORTC is enabled
-//     // Opening in FILE_APPEND mode is safe - it won't overwrite existing content
-//     File touchFile = SD.open(filepath, FILE_APPEND);
-//     if (touchFile) {
-//         // File opened successfully - just close it to trigger timestamp update
-//         // The file pointer is already at the end, so no data is written
-//         touchFile.close();
-//     }
-//     // If file open fails, timestamp update is not critical - continue anyway
-// }
+// This is called AFTER successful writes, so it shouldn't interfere with mounting
+void updateFileTimestamp(const String& filepath) {
+    // Only update timestamp if SD card is initialized and file exists
+    if (!sd_card_initialized) {
+        return;  // SD card not available
+    }
+    
+    // Try to update file timestamp by opening in append mode and closing
+    // This may trigger FatFS to update the modification time
+    // Note: FatFS may not update timestamps if FF_FS_NORTC is enabled,
+    // but this is the best we can do without modifying the ESP32 core
+    File touchFile = SD.open(filepath, FILE_APPEND);
+    if (touchFile) {
+        // File opened successfully - just close it to trigger timestamp update
+        // The file pointer is already at the end, so no data is written
+        touchFile.close();
+        // Note: This may or may not work depending on FatFS configuration
+        // If timestamps still show 1980, FatFS has RTC disabled (FF_FS_NORTC = 1)
+    }
+    // If file open fails, timestamp update is not critical - continue anyway
+    // This shouldn't happen if the file was just written successfully
+}
 
 // Log sensor data to SD card
 void logToSDCard(const SensorData& data, bool is_alarm) {
@@ -1229,9 +1237,9 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
         
         dataFile.close();
         
-        // COMMENTED OUT: Timestamp update - may cause SD card mounting issues
         // Update file timestamp to reflect last write time
-        // updateFileTimestamp(filepath);
+        // This is safe to do after successful write - won't interfere with mounting
+        updateFileTimestamp(filepath);
         
         // Print success message with data details
         Serial.print("[SD] Successfully saved to ");
@@ -1289,9 +1297,9 @@ void logAcknowledgmentToSD() {
         
         dataFile.close();
         
-        // COMMENTED OUT: Timestamp update - may cause SD card mounting issues
         // Update file timestamp to reflect last write time
-        // updateFileTimestamp(filepath);
+        // This is safe to do after successful write - won't interfere with mounting
+        updateFileTimestamp(filepath);
         
         Serial.print("[SD] Successfully saved alarm acknowledgment to ");
         Serial.println(filepath);
