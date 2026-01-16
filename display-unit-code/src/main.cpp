@@ -1051,9 +1051,20 @@ String getWeekFolderPath() {
     return String(folder_path);
 }
 
-// Get the current log file path with week folder
+// Get the current log file path - now uses filename instead of directory
+// Format: /Week_YYYY_WW_sensor_log.csv (e.g., /Week_2026_03_sensor_log.csv)
 String getCurrentLogFilePath() {
-    return getWeekFolderPath() + "sensor_log.csv";
+    if (!rtc.begin()) {
+        return "/Week_0000_00_sensor_log.csv";  // Fallback if RTC not available
+    }
+    
+    DateTime now = rtc.now();
+    int year = now.year();
+    int week = getWeekNumber(year, now.month(), now.day());
+    
+    char file_path[35];
+    snprintf(file_path, sizeof(file_path), "/Week_%04d_%02d_sensor_log.csv", year, week);
+    return String(file_path);
 }
 
 // Ensure the week folder exists, create it if it doesn't
@@ -1147,13 +1158,10 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
         return;  // SD card not available
     }
     
-    // Get the current log file path (includes week folder)
+    // Get the current log file path (now uses filename format: /Week_YYYY_WW_sensor_log.csv)
     String filepath = getCurrentLogFilePath();
     
-    // Try to ensure week folder exists (may fail silently if it already exists)
-    ensureWeekFolderExists();
-    
-    // Ensure CSV header exists (this will also create the directory if needed)
+    // Ensure CSV header exists (file will be created automatically if it doesn't exist)
     ensureCSVHeaderExists(filepath);
     
     // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
@@ -1222,13 +1230,10 @@ void logAcknowledgmentToSD() {
         return;  // SD card not available
     }
     
-    // Get the current log file path (includes week folder)
+    // Get the current log file path (now uses filename format: /Week_YYYY_WW_sensor_log.csv)
     String filepath = getCurrentLogFilePath();
     
-    // Try to ensure week folder exists (may fail silently if it already exists)
-    ensureWeekFolderExists();
-    
-    // Ensure CSV header exists (this will also create the directory if needed)
+    // Ensure CSV header exists (file will be created automatically if it doesn't exist)
     ensureCSVHeaderExists(filepath);
     
     // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
@@ -1554,24 +1559,16 @@ void setup() {
             // Clean up test file
             SD.remove("/test_write.txt");
             
-            // Test week folder creation and CSV file setup
-            Serial.println("[SD] Step 3: Testing week folder structure...");
-            if (ensureWeekFolderExists()) {
-                String week_path = getWeekFolderPath();
-                Serial.print("[SD] Week folder: ");
-                Serial.println(week_path);
-                
-                String log_path = getCurrentLogFilePath();
-                Serial.print("[SD] Log file path: ");
-                Serial.println(log_path);
-                
-                if (ensureCSVHeaderExists(log_path)) {
-                    Serial.println("[SD] Step 3: SUCCESS - Week folder structure ready");
-                } else {
-                    Serial.println("[SD] Step 3: WARNING - Could not create CSV file");
-                }
+            // Test CSV file creation (no directories needed - files go in root)
+            Serial.println("[SD] Step 3: Testing CSV file creation...");
+            String log_path = getCurrentLogFilePath();
+            Serial.print("[SD] Log file path: ");
+            Serial.println(log_path);
+            
+            if (ensureCSVHeaderExists(log_path)) {
+                Serial.println("[SD] Step 3: SUCCESS - CSV file ready");
             } else {
-                Serial.println("[SD] Step 3: WARNING - Could not create week folder");
+                Serial.println("[SD] Step 3: WARNING - Could not create CSV file");
             }
             
             Serial.println("[SD] ========================================");
