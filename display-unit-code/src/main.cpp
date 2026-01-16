@@ -1007,6 +1007,39 @@ bool checkAlarmConditions(const SensorData& data) {
             data.current_draw > CURRENT_MAX);
 }
 
+// Get status string describing which sensors are alarming
+// Returns "NORMAL" if no alarms, or comma-separated list of alarm conditions
+String getAlarmStatus(const SensorData& data) {
+    String status = "";
+    
+    if (data.oil_temp < TEMP_MIN) {
+        if (status.length() > 0) status += ",";
+        status += "OIL_TEMP_LOW";
+    }
+    
+    if (data.motor_temp < TEMP_MIN) {
+        if (status.length() > 0) status += ",";
+        status += "MOTOR_TEMP_LOW";
+    }
+    
+    if (data.vibration > VIBRATION_MAX) {
+        if (status.length() > 0) status += ",";
+        status += "VIBRATION_HIGH";
+    }
+    
+    if (data.current_draw > CURRENT_MAX) {
+        if (status.length() > 0) status += ",";
+        status += "CURRENT_HIGH";
+    }
+    
+    // Return "NORMAL" if no alarms detected
+    if (status.length() == 0) {
+        status = "NORMAL";
+    }
+    
+    return status;
+}
+
 // Calculate week number (1-52/53) based on day of year
 // Simple calculation: week = (day_of_year - 1) / 7 + 1
 int getWeekNumber(int year, int month, int day) {
@@ -1102,7 +1135,7 @@ bool ensureCSVHeaderExists(const String& filepath) {
         // File doesn't exist, create it with header
         dataFile = SD.open(filepath, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
+            dataFile.println("datetime,oil_temp,motor_temp,vibration,current_draw,status");
             dataFile.close();
             Serial.print("[SD] Created new CSV file with header: ");
             Serial.println(filepath);
@@ -1119,7 +1152,7 @@ bool ensureCSVHeaderExists(const String& filepath) {
             dataFile.close();
             dataFile = SD.open(filepath, FILE_WRITE);
             if (dataFile) {
-                dataFile.println("timestamp,datetime,oil_temp,motor_temp,vibration,current_draw,status");
+                dataFile.println("datetime,oil_temp,motor_temp,vibration,current_draw,status");
                 dataFile.close();
                 Serial.print("[SD] Added header to empty CSV file: ");
                 Serial.println(filepath);
@@ -1167,9 +1200,7 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
     // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
     File dataFile = SD.open(filepath, FILE_APPEND);
     if (dataFile) {
-        // CSV format: timestamp, datetime, oil_temp, motor_temp, vibration, current_draw, status
-        unsigned long timestamp = millis() / 1000;  // Seconds since boot
-        
+        // CSV format: datetime, oil_temp, motor_temp, vibration, current_draw, status
         // Add RTC datetime if available
         String datetime_str = "";
         if (rtc.begin()) {
@@ -1181,8 +1212,9 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
             datetime_str = String(dt_buf);
         }
         
-        dataFile.print(timestamp);
-        dataFile.print(",");
+        // Get detailed alarm status (which sensors are alarming)
+        String status = getAlarmStatus(data);
+        
         dataFile.print(datetime_str);
         dataFile.print(",");
         dataFile.print(data.oil_temp, 2);
@@ -1193,7 +1225,7 @@ void logToSDCard(const SensorData& data, bool is_alarm) {
         dataFile.print(",");
         dataFile.print(data.current_draw, 2);
         dataFile.print(",");
-        dataFile.println(is_alarm ? "ALARM" : "NORMAL");
+        dataFile.println(status);
         
         dataFile.close();
         
@@ -1239,8 +1271,6 @@ void logAcknowledgmentToSD() {
     // Open file for appending (FILE_APPEND ensures data is added to end, not overwritten)
     File dataFile = SD.open(filepath, FILE_APPEND);
     if (dataFile) {
-        unsigned long timestamp = millis() / 1000;  // Seconds since boot
-        
         // Add RTC datetime if available
         String datetime_str = "";
         if (rtc.begin()) {
@@ -1253,8 +1283,6 @@ void logAcknowledgmentToSD() {
         }
         
         // Log acknowledgment event with empty sensor values and ACKNOWLEDGED status
-        dataFile.print(timestamp);
-        dataFile.print(",");
         dataFile.print(datetime_str);
         dataFile.print(",,,,");  // Empty sensor values (oil_temp, motor_temp, vibration, current_draw)
         dataFile.println("ACKNOWLEDGED");
