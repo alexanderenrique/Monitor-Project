@@ -277,7 +277,7 @@ float readCurrentTransformer(int pin, float &rms_millivolts)
     rms_millivolts = rms_mv;
 
     // You MUST calibrate this number:
-    const float MILLIVOLTS_PER_AMP = 3.6; // placeholder — adjust after calibration
+    const float MILLIVOLTS_PER_AMP = 7.2; // placeholder — adjust after calibration
 
     float amps = rms_mv / MILLIVOLTS_PER_AMP;
   #ifndef TEST_MODE
